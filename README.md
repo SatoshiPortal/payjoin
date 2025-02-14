@@ -1,6 +1,6 @@
 # Payjoin Cypherapp (MVP)
 
-This payjoin cypherapp is a basic implementation that makes use of payjoin-cli from https://github.com/payjoin/rust-payjoin. The will run a `payjoin-cli resume` process in the background as well as a simlpe HTTP server that will accept Payjoin requests and attempt to process them.
+This payjoin cypherapp is a basic implementation that makes use of payjoin-cli from https://github.com/payjoin/rust-payjoin. The container will run a `payjoin-cli resume` process in the background as well as a simlpe HTTP server that will accept Payjoin requests and attempt to process them.
 
 The API is simple and handles two request types: send and receive.
 

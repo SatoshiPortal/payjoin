@@ -1,0 +1,36 @@
+version: '3'
+
+services:
+  payjoin-send:
+    image: cyphernode/payjoin:v0.1.0-local
+    build:
+      context: .
+      target: dev
+    ports:
+      - "3002:3002"
+      - "8001:8000"
+    volumes:
+      - ${PWD}/cypherapps/data-sender:/data
+    networks:
+      - cyphernodeappsnet
+      - cyphernodenet
+
+  payjoin-receive:
+    image: cyphernode/payjoin:v0.1.0-local
+    build:
+      context: .
+      target: dev
+    ports:
+      - "3000:3000"
+      - "8000:8000"
+    volumes:
+      - ${PWD}/cypherapps/data:/data
+    networks:
+      - cyphernodeappsnet
+      - cyphernodenet
+
+networks:
+  cyphernodeappsnet:
+    external: true
+  cyphernodenet:
+    external: true

@@ -1,3 +1,5 @@
+# Payjoin Cypherapp (MVP)
+
 This payjoin cypherapp is a basic implementation that makes use of payjoin-cli from https://github.com/payjoin/rust-payjoin. The will run a `payjoin-cli resume` process in the background as well as a simlpe HTTP server that will accept Payjoin requests and attempt to process them.
 
 The API is simple and handles two request types: send and receive.
@@ -138,7 +140,6 @@ urijson=$(curl -s -d "{\"address\": \"${address}\", \"amount\": 100000}" http://
 
 Create a Payjoin receive request without providing an address
 ```bash
-curl -d '{"amount": 1000000}' http://localhost/receive
 urijson=$(curl -s -d '{"amount": 1000000}' http://localhost:8000/receive | jq -cr)
 ```
 

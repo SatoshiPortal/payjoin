@@ -1,92 +1,83 @@
+# Base image for building dependencies
+FROM node:23.1-bookworm-slim AS build-base
 
-FROM rust:1.84.1-slim-bookworm AS base
+COPY pj-ts /payjoin-typescript
 
-RUN apt-get clean && \
-    rm -rf /var/lib/apt/lists/* && \
-    apt-get update -y && \
-    apt-get install -y \
-        build-essential \
-        ca-certificates \
-        git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    curl \
+    postgresql-client \
+    git \
+    openssh-client \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src
-RUN git clone --branch payjoin-0.22.0 https://github.com/payjoin/rust-payjoin.git
-WORKDIR /usr/src/rust-payjoin
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo --version && rustc --version
 
-COPY patches /usr/src/rust-payjoin/patches
-RUN git apply patches/*
+WORKDIR /payjoin-typescript
+RUN npm install
+# temp hack
+RUN ln -s index.linux-x64-gnu.node index.linux-x64 
 
-RUN cargo update -p cc --precise 1.0.105 && \
-    cargo update -p regex --precise 1.9.6 && \
-    cargo update -p reqwest --precise 0.12.4 && \
-    cargo update -p url --precise 2.5.0 && \
-    cargo update -p tokio --precise 1.38.1 && \
-    cargo update -p tokio-util --precise 0.7.11 && \
-    cargo update -p which --precise 4.4.0 && \
-    cargo update -p zstd-sys --precise 2.0.8+zstd.1.5.5 && \
-    cargo update -p clap_lex --precise 0.3.0 && \
-    cargo update -p time --precise 0.3.20
+WORKDIR /payjoin
+COPY package.json /payjoin
+RUN sed -i 's|"payjoin-ts": ".*"|"payjoin-ts": "file:/payjoin-typescript"|g' package.json
+RUN npm install
 
+#--------------------------------------------------------------
 
-FROM base AS builder-dev
+# Development image
+FROM node:23.1-bookworm-slim AS dev
 
-RUN apt-get update && \
-    apt-get install -y openssl && \
-    rm -rf /var/lib/apt/lists/*
+WORKDIR /payjoin
 
-RUN cargo build --release -p payjoin-cli --features v2,_danger-local-https
+COPY --from=build-base /payjoin/node_modules/ /payjoin/node_modules/
+COPY --from=build-base /payjoin-typescript/ /payjoin-typescript/
+COPY package.json /payjoin
+COPY tsconfig.json /payjoin
+COPY src /payjoin/src
 
-RUN cd /tmp && \
-    openssl req -x509 \
-        -newkey rsa:2048 \
-        -keyout /tmp/key.der \
-        -out /tmp/localhost.der \
-        -days 365 \
-        -nodes \
-        -subj "/CN=localhost" \
-        -outform DER \
-        -keyform DER && \
-    chmod 600 /tmp/key.der && \
-    chmod 644 /tmp/localhost.der
-
-
-FROM base AS builder-prod
-
-RUN cargo build --release -p payjoin-cli --features v2
-
-FROM debian:bookworm-slim AS dev
-
-RUN apt-get update && \
-    apt-get install -y \
-        procps \
-        ncat \
-        jq \
-        lsof \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    curl \
+    postgresql-client \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder-dev /usr/src/rust-payjoin/target/release/payjoin-cli /usr/local/bin/
-COPY --from=builder-dev /tmp/key.der /tmp/
-COPY --from=builder-dev /tmp/localhost.der /tmp/
-COPY scripts /scripts
-RUN chmod +x /scripts/*
+EXPOSE 8000
 
-EXPOSE 3000 3002 8000
-CMD ["/scripts/start.sh"]
+CMD ["npm", "run", "start:dev"]
 
+#--------------------------------------------------------------
 
-FROM debian:bookworm-slim AS prod
+# Production image
+FROM node:23.1-bookworm-slim AS prod
 
-RUN apt-get update && \
-    apt-get install -y \
-        procps \
-        ncat \
-        jq \
+WORKDIR /payjoin
+
+COPY --from=build-base /payjoin/node_modules/ /payjoin/node_modules/
+COPY --from=build-base /payjoin-typescript/ /payjoin-typescript/
+COPY package.json /payjoin
+COPY tsconfig.json /payjoin
+COPY src /payjoin/src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    curl \
+    postgresql-client \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder-prod /usr/src/rust-payjoin/target/release/payjoin-cli /usr/local/bin/
-COPY scripts /scripts
-RUN chmod +x /scripts/*
+RUN npx prisma generate
+RUN npm run build
 
-EXPOSE 3000 8000
-CMD ["/scripts/start.sh"]
+EXPOSE 8000
+
+CMD ["npm", "run", "start"]

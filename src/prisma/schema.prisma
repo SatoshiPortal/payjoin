@@ -1,0 +1,60 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Send {
+  id            Int           @id @default(autoincrement())
+  bip21         String        @unique
+  amount        BigInt
+  txid          String?
+  address       String?
+  fee           BigInt?
+  callbackUrl   String?       @map("callback_url")
+  calledBackTs  DateTime?     @map("called_back_ts")
+  expiryTs      DateTime?     @map("expiry_ts")
+  cancelledTs   DateTime?     @map("cancelled_ts")
+  session       String?
+  confirmedTs   DateTime?     @map("confirmed_ts")
+  createdTs     DateTime      @default(now()) @map("created_ts")
+  updatedTs     DateTime      @updatedAt @map("updated_ts")
+
+  @@index([bip21])
+  @@index([address])
+  @@index([txid])
+
+  @@map("send")
+}
+
+model Receive {
+  id            Int           @id @default(autoincrement())
+  bip21         String        @unique
+  address       String        @unique
+  amount        BigInt
+  txid          String?
+  fallbackTxHex String?       @map("fallback_tx_hex")
+  callbackUrl   String?       @map("callback_url")
+  calledBackTs  DateTime?     @map("called_back_ts")
+  expiryTs      DateTime?     @map("expiry_ts")
+  cancelledTs   DateTime?     @map("cancelled_ts")
+  session       String?
+  confirmedTs   DateTime?     @map("confirmed_ts")
+  createdTs     DateTime      @default(now()) @map("created_ts")
+  updatedTs     DateTime      @updatedAt @map("updated_ts")
+
+  @@index([bip21])
+  @@index([address])
+  @@index([txid])
+
+  @@map("receive")
+}

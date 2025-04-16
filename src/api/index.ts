@@ -2,7 +2,7 @@ import express, { Application, Request, Response, NextFunction } from "express";
 import { JSONRPCServer } from 'json-rpc-2.0';
 import logger from "../lib/Log2File";
 import Utils from "../lib/Utils";
-import { handleAddressCallback, handleTxCallback } from "./callback";
+import { handleAddressCallback } from "./callback";
 import { registerConfigApi } from "./config";
 import { registerReceiveApi } from "./receive";
 import { registerSendApi } from "./send";
@@ -57,17 +57,16 @@ export function registerApi(app: Application): void {
   registerSendApi();
   registerReceiveApi();
 
-  // confirmation tx callback handler
-  app.post('/tx/*', async (req: Request, res: Response) => {
-    handleTxCallback(req.body).catch((e: any) => {
-      logger.error('callback', 'Failed to handle confirm callback:', e);
+  // address callback handler for watching addresses
+  app.post('/send/address/*', async (req: Request, res: Response) => {
+    handleAddressCallback(req.body, "send").catch((e: any) => {
+      logger.error('callback', 'Failed to handle address callback:', e);
     });
     res.sendStatus(200);
   });
 
-  // address callback handler for watching addresses needing to be premixed
-  app.post('/address/*', async (req: Request, res: Response) => {
-    handleAddressCallback(req.body).catch((e: any) => {
+  app.post('/receive/address/*', async (req: Request, res: Response) => {
+    handleAddressCallback(req.body, "receive").catch((e: any) => {
       logger.error('callback', 'Failed to handle address callback:', e);
     });
     res.sendStatus(200);

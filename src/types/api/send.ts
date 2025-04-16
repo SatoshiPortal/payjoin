@@ -1,3 +1,5 @@
+import { SendStatus } from "../payjoin";
+
 export interface IReqSend {
   bip21: string;
   callbackUrl?: string;
@@ -10,11 +12,11 @@ export interface IRespSend {
   address: string;
   txid?: string;
   fee?: bigint;
-  status: string; // @todo update this to a specific enum
+  status: SendStatus
   confirmedTs?: Date;
   cancelledTs?: Date;
   callbackUrl?: string;
-  calledBackTs?: string;
+  calledBackTs?: Date;
   createdTs: Date;
   updatedTs: Date;
 }

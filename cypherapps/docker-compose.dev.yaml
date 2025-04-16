@@ -26,6 +26,9 @@ services:
     build:
       context: .
       target: dev
+    environment:
+      # need this in here because sync-request ignores rejectUnauthorized=false
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
     command: ["npm", "run", "start:dev"]
     volumes:
       - "$APP_SCRIPT_PATH/../:/payjoin"

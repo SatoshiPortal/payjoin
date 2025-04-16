@@ -2,13 +2,16 @@ import { JSONRPCErrorCode, JSONRPCErrorException } from "json-rpc-2.0";
 import { reloadConfig as execReloadConfig, Config } from "../../config";
 import logger from "../../lib/Log2File";
 import { startCron } from "../../cron";
+import { cnClient, syncCnClient } from "../../lib/globals";
 
 export async function reloadConfig(): Promise<Config> {
   logger.info(reloadConfig, 'reloading Config');
   try {
 
-    const config = await execReloadConfig();
-    startCron();
+    const config = execReloadConfig();
+    cnClient.configureCyphernode(config);
+    syncCnClient.configureCyphernode(config);
+    startCron(config);
 
     return config;
   } catch (e) {

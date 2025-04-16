@@ -67,13 +67,24 @@ import IRespListLockUnspent from "../types/cyphernode/IRespListLockUnspent";
 import { IReqGetFeeRate } from "../types/cyphernode/IReqGetFeeRate";
 import IRespGetFeeRate from "../types/cyphernode/IRespGetFeeRate";
 import IRespValidateAddress from "../types/cyphernode/IRespValidateAddress";
+import { IReqProcessPsbt } from "../types/cyphernode/IReqProcessPsbt";
+import IRespProcessPsbt from "../types/cyphernode/IRespProcessPsbt";
+import { IReqCreateFundedPsbt } from "../types/cyphernode/IReqCreateFundedPsbt";
+import IRespCreateFundedPsbt from "../types/cyphernode/IRespCreateFundedPsbt";
+import { IReqFinalizePsbt } from "../types/cyphernode/IReqFinalizePsbt";
+import IRespFinalizePsbt from "../types/cyphernode/IRespFinalizePsbt";
+import { IReqTestMempoolAccept } from "../types/cyphernode/IReqTestMempoolAccept";
+import IRespTestMempoolAccept from "../types/cyphernode/IRespTestMempoolAccept";
+import { IReqGetAddressInfo } from "../types/cyphernode/IReqGetAddressInfo";
+import IRespGetAddressInfo from "../types/cyphernode/IRespGetAddressInfo";
+import IRespDecodeScript from "../types/cyphernode/IRespDecodeScript";
 
 class CyphernodeClient {
-  private baseURL: string;
-  private readonly h64: string = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9Cg==";
+  protected baseURL: string;
+  protected readonly h64: string = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9Cg==";
   private apiId: string;
   private apiKey: string;
-  private caFile: string;
+  protected caFile: string;
 
   constructor(config: Config) {
     this.baseURL = config.CN_URL;
@@ -147,9 +158,9 @@ class CyphernodeClient {
         if (error.response) {
           // The request was made and the server responded with a status code
           // that falls out of the range of 2xx
-          // logger.info("CyphernodeClient._post :: error.response.data:", error.response.data);
-          // logger.info("CyphernodeClient._post :: error.response.status:", error.response.status);
-          // logger.info("CyphernodeClient._post :: error.response.headers:", error.response.headers);
+          logger.info("CyphernodeClient._post :: error.response.data:", error.response.data);
+          logger.info("CyphernodeClient._post :: error.response.status:", error.response.status);
+          logger.info("CyphernodeClient._post :: error.response.headers:", error.response.headers);
 
           return { status: error.response.status, data: error.response.data };
         } else if (error.request) {
@@ -334,7 +345,7 @@ class CyphernodeClient {
     logger.info("CyphernodeClient.getbalance", params);
 
     let uri = "/getbalance";
-    if (params.wallet) {
+    if (params && params.wallet) {
       uri += `/${params.wallet}`;
     }
     const response = await this._get(uri);
@@ -943,6 +954,54 @@ class CyphernodeClient {
     const response = await this._get(`/validateaddress/${address}`);
 
     return this.handleResponse(response) as IRespValidateAddress;
+  }
+
+  async createFundedPsbt(params: IReqCreateFundedPsbt): Promise<IRespCreateFundedPsbt> {
+    logger.info("CyphernodeClient.createFundedPsbt:", params);
+
+    const response = await this._post("/createfundedpsbt", params);
+
+    return this.handleResponse(response) as IRespCreateFundedPsbt;
+  }
+
+  async processPsbt(params: IReqProcessPsbt): Promise<IRespProcessPsbt> {
+    logger.info("CyphernodeClient.processPsbt:", params);
+
+    const response = await this._post("/processpsbt", params);
+
+    return this.handleResponse(response) as IRespProcessPsbt;
+  }
+
+  async finalizePsbt(params: IReqFinalizePsbt): Promise<IRespFinalizePsbt> {
+    logger.info("CyphernodeClient.finalizePsbt:", params);
+
+    const response = await this._post("/finalizepsbt", params);
+
+    return this.handleResponse(response) as IRespFinalizePsbt;
+  }
+
+  async testMempoolAccept(params: IReqTestMempoolAccept): Promise<IRespTestMempoolAccept> {
+    logger.info("CyphernodeClient.testMempoolAccept:", params);
+
+    const response = await this._post("/testmempoolaccept", params);
+
+    return this.handleResponse(response) as IRespTestMempoolAccept;
+  }
+
+  async getAddressInfo(params: IReqGetAddressInfo): Promise<IRespGetAddressInfo> {
+    logger.info("CyphernodeClient.getAddressInfo:", params);
+
+    const response = await this._post("/getaddressinfo", params);
+
+    return this.handleResponse(response) as IRespGetAddressInfo;
+  }
+
+  async decodeScript(scriptPubKey: string): Promise<IRespDecodeScript> {
+    logger.info("CyphernodeClient.decodeScript:", scriptPubKey);
+
+    const response = await this._get(`/decodescript/${scriptPubKey}`);
+
+    return this.handleResponse(response) as IRespDecodeScript;
   }
 }
 

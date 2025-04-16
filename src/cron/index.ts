@@ -1,14 +1,13 @@
-import { config } from '../config';
+import { Config } from '../config';
 import logger from "../lib/Log2File";
 import { restoreSendSessions } from "./send";
 import { restoreReceiveSessions } from "./receive";
-import AsyncLock from 'async-lock';
+import { lock } from "../lib/globals";
 
-const lock = new AsyncLock();
 const lockName = "sessions";
 let activeInterval: NodeJS.Timeout | null = null;
 
-export function startCron() {
+export function startCron(config: Config) {
   if (activeInterval) {
     logger.info(startCron, "Stopping previous interval");
     clearInterval(activeInterval);
@@ -17,7 +16,7 @@ export function startCron() {
 
   const interval = config.CRON_INTERVAL; // in seconds
 
-  const runJob = async () => {
+  const runJob = async (config: Config) => {
     if (lock.isBusy(lockName)) {
       logger.info(runJob, "Previous interval is still running");
       return;
@@ -30,7 +29,7 @@ export function startCron() {
 
       try {
         await restoreSendSessions();
-        await restoreReceiveSessions();
+        await restoreReceiveSessions(config);
       } catch (e) {
         logger.error(runJob, "Failed to restore sessions:", e);
       }
@@ -39,6 +38,6 @@ export function startCron() {
     });
   };
 
-  activeInterval = setInterval(runJob, interval * 1000);
+  activeInterval = setInterval(() => runJob(config), interval * 1000);
   logger.info(startCron, `Started interval every ${interval} seconds`);
 }

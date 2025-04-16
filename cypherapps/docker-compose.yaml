@@ -31,6 +31,9 @@ services:
       - "$APP_SCRIPT_PATH/data/config.env:/payjoin/.env"
       - "$GATEKEEPER_DATAPATH/certs/cert.pem:/payjoin/cert.pem:ro"
       - "$APP_SCRIPT_PATH/data/logs:/payjoin/logs"
+    environment:
+      # need this in here because sync-request ignores rejectUnauthorized=false
+    - NODE_TLS_REJECT_UNAUTHORIZED=0
     networks:
       - cyphernodeappsnet
 

@@ -42,12 +42,15 @@ model Receive {
   address       String        @unique
   amount        BigInt
   txid          String?
+  fee           BigInt?
   fallbackTxHex String?       @map("fallback_tx_hex")
   callbackUrl   String?       @map("callback_url")
   calledBackTs  DateTime?     @map("called_back_ts")
   expiryTs      DateTime?     @map("expiry_ts")
   cancelledTs   DateTime?     @map("cancelled_ts")
   session       String?
+  firstSeenTs   DateTime?     @map("first_seen_ts")
+  fallbackTs    DateTime?     @map("fallback_broadcast_ts")
   confirmedTs   DateTime?     @map("confirmed_ts")
   createdTs     DateTime      @default(now()) @map("created_ts")
   updatedTs     DateTime      @updatedAt @map("updated_ts")
@@ -57,4 +60,18 @@ model Receive {
   @@index([txid])
 
   @@map("receive")
+}
+
+model SeenInputs {
+  id            Int           @id @default(autoincrement())
+  txid          String
+  vout          Int
+  bip21         String?
+  createdTs     DateTime      @default(now()) @map("created_ts")
+  updatedTs     DateTime      @updatedAt @map("updated_ts")
+
+  @@index([txid])
+  @@index([bip21])
+
+  @@map("seen_inputs")
 }

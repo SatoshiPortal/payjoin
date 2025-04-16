@@ -49,11 +49,11 @@ class Utils {
     };
     if (headers) configs.headers = headers;
 
-    logger.debug("Utils.post :: configs:", configs);
+    //logger.debug("Utils.post :: configs:", configs);
 
     try {
       const response = await axios.request(configs);
-      logger.debug("Utils.post :: response.data:", response.data);
+      //logger.debug("Utils.post :: response.data:", response.data);
 
       return { status: response.status, data: response.data };
     } catch (err) {

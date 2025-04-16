@@ -1,3 +1,5 @@
+import { ReceiveStatus } from "../payjoin";
+
 export interface IReqReceive {
   address?: string;
   amount: bigint;
@@ -9,12 +11,12 @@ export interface IRespReceive {
   bip21: string;
   amount: bigint;
   address: string;
-  txid?: string;
-  status: string; // @todo update this to a specific enum
-  expiryTs: Date;
-  confirmedTs?: Date;
-  cancelledTs?: Date;
-  callbackUrl?: string;
+  txid?: string | null;
+  status: ReceiveStatus
+  expiryTs: Date | null;
+  confirmedTs?: Date | null;
+  cancelledTs?: Date | null;
+  callbackUrl?: string | null;
   calledBackTs?: Date;
   createdTs: Date;
   updatedTs: Date;

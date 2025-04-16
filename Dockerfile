@@ -13,16 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     ca-certificates \
+    python3 \
+    python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo --version && rustc --version
 
+
 WORKDIR /payjoin-typescript
-RUN npm install
+RUN npm install --also=dev
 # temp hack
-RUN ln -s index.linux-x64-gnu.node index.linux-x64 
+#RUN ln -s index.linux-x64-gnu.node index.linux-x64 
 
 WORKDIR /payjoin
 COPY package.json /payjoin
@@ -72,6 +75,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     postgresql-client \
     ca-certificates \
+    python3 \
+    python-is-python3 \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

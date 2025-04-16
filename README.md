@@ -23,7 +23,7 @@ curl -X POST http://localhost:8000/jsonrpc \
           "id": 1,
           "method": "receive",
           "params": {
-            "address": "bcrt1q8a9v943thzgqqeg9zycrryae3cgpng6k59nqr4",
+            "address": "bcrt1qu2xt7tsqastdgv2pnresamwm4t6je5lgtmfkvh",
             "amount": 10000000,
             "callbackUrl": "https://example.com/callback"
           }
@@ -40,9 +40,9 @@ curl -H 'Content-Type: application/json' \
   "id": 1,
   "method": "receive",
   "params": {
-    "amount": 10000000
+    "amount": 100000
   }
-}' http://localhost:8000/jsonrpc
+}' http://localhost:8000/jsonrpc | jq
 ```
 
 #### Successful response:
@@ -105,21 +105,61 @@ curl -H 'Content-Type: application/json' \
 }
 ```
 
+### Cancel Receive
+
+Cancel a Payjoin receive request if it is still pending:
+```bash
+curl -X POST http://localhost:8000/jsonrpc \
+     -H "Content-Type: application/json" \
+     -d '{
+          "jsonrpc": "2.0",
+          "id": 1,
+          "method": "cancelReceive",
+          "params": {
+            "id": 12,
+          }
+        }' | jq
+```
+
+#### Successful response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "id": 12
+  }
+}
+```
+
+#### Error response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "Cannot cancel a confirmed receive session",
+    "data": null
+  }
+}
+```
+
 
 ### Send
 
 Send a Payjoin transaction:
 ```bash
 curl -H 'Content-Type: application/json' \
- -d "{
+ -d '{
   "jsonrpc": "2.0",
   "id": 1,
   "method": "send",
   "params": {
-    "bip21": "bitcoin:bcrt1q5f6jz3hn9nv3wx3sjgea5p37yldc5p3xrphau4?amount=0.001&pjos=0&pj=HTTPS://PAYJO.IN/DY0LZN5AKK8FJ%23RK1QTVMMHJ8PPST9HCYZENL87YHCCNVNU2S5PF789HMXHGHLR4FUFN8S+OH1QYPM59NK2LXXS4890SUAXXYT25Z2VAPHP0X7YEYCJXGWAG6UG9ZU6NQ+EX1DRD6UEC",
+    "bip21": "bitcoin:bcrt1q8t76dtn5sgcrl76hcf2qq7a5ftmdyyzlwu6d7s?amount=0.02&pjos=0&pj=HTTPS://PAYJO.IN/L4WRZY4DHPM2C%23RK1QTXEMELZ47U68AGCX2LTFLKQ4ZAY9TK8J5LP4TDU4V39MTT3UZ0V6+OH1QYP87E2AVMDKXDTU6R25WCPQ5ZUF02XHNPA65JMD8ZA2W4YRQN6UUWG+EX16EMSQ6Q",
     "callbackUrl": "https://example.com/callback"
   }
-}" http://localhost:8000/jsonrpc
+}' http://localhost:8000/jsonrpc | jq
 ```
 
 #### Successful response:
@@ -169,6 +209,47 @@ curl -H 'Content-Type: application/json' \
   }
 }
 ```
+
+### Cancel Send
+
+Cancel a Payjoin send request if it is still pending:
+```bash
+curl -X POST http://localhost:8000/jsonrpc \
+     -H "Content-Type: application/json" \
+     -d '{
+          "jsonrpc": "2.0",
+          "id": 1,
+          "method": "cancelSend",
+          "params": {
+            "id": 21,
+          }
+        }' | jq
+```
+
+#### Successful response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "id": 21
+  }
+}
+```
+
+#### Error response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "Cannot cancel a confirmed send session",
+    "data": null
+  }
+}
+```
+
 
 ## Other useful commands
 

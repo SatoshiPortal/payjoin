@@ -1,9 +1,6 @@
 import { BtcUri } from 'payjoin-ts';
 import logger from './Log2File';
-import { config } from '../config';
-import  { CyphernodeClient } from './CyphernodeClient';
-
-const cnClient = new CyphernodeClient(config);
+import { cnClient } from "./globals";
 
 export async function isValidBip21(bip21: string): Promise<boolean> {
   logger.info(isValidBip21, bip21);
@@ -14,8 +11,7 @@ export async function isValidBip21(bip21: string): Promise<boolean> {
   }
 
   try {
-    // should this actually use BtcUri.tryFrom(...) ?
-    const uri = new BtcUri(bip21);
+    const uri = BtcUri.tryFrom(bip21);
     if (!uri) {
       return false;
     }

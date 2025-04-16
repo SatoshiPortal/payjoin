@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
+
 export interface Config {
   BASE_DIR: string;
   URL_SERVER: string;
@@ -8,13 +9,10 @@ export interface Config {
   CN_URL: string;
   CN_API_ID: string;
   CN_API_KEY: string;
-  CN_MQTT_BROKER: string;
-  COINFUSER_URL: string;
-  COINFUSER_AUTH: string;
   CRON_INTERVAL: number; // the number of seconds between polling the ohttp relay
   SEND_WALLET: string; // the wallet to use for sending from (e.g. "01", "02", etc)
   RECEIVE_WALLET: string; // the wallet to use for receiving addresses to (e.g. "01", "02", etc)
-  PAYJOIN_DIRECTORY: string; // the directory where the payjoin data is stored
+  PAYJOIN_DIRECTORY: string; // the directory server where the payjoin data is stored
   PAYJOIN_EXPIRY: bigint; // the number of seconds before a payjoin request expires
   OHTTP_RELAY: string; // the URL of the ohttp relay ( https://pj.bobspacebkk.com, https://ohttp.cakewallet.com, https://pj.benalleng.com )
 } 
@@ -26,15 +24,12 @@ export let config: Config = {
   CN_URL: process.env.CN_URL || "https://gatekeeper:2009/v0",
   CN_API_ID: process.env.CN_API_ID || "",
   CN_API_KEY: process.env.CN_API_KEY || "",
-  CN_MQTT_BROKER: process.env.CN_MQTT_BROKER || "mqtt://broker",
-  COINFUSER_URL: process.env.COINFUSER_URL || "http://coinfuser:3000",
-  COINFUSER_AUTH: process.env.COINFUSER_AUTH || "",
   CRON_INTERVAL: Number(process.env.CRON_INTERVAL  || 60),
   SEND_WALLET: process.env.SEND_WALLET || "01",
   RECEIVE_WALLET: process.env.RECEIVE_WALLET || "01",
   PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",
   PAYJOIN_EXPIRY: BigInt(process.env.PAYJOIN_EXPIRY  || 3600),
-  OHTTP_RELAY: process.env.OHTTP_RELAY || "https://ohttp.cakewallet.com",
+  OHTTP_RELAY: process.env.OHTTP_RELAY || "https://pj.benalleng.com",
 };
 
 export function reloadConfig(): Config {

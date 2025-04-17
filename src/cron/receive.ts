@@ -4,6 +4,8 @@ import logger from "../lib/Log2File";
 import { Config } from "../config";
 import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
+import Utils from "../lib/Utils";
+import { extractFeeFromPsbt } from "../lib/payjoin";
 
 // used to cache and store known (or "seen") inputs
 // which are used to determine someone is attempting a probing attack
@@ -237,6 +239,43 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       // after a certain amount of time if the payjoin tx is not broadcasted.
       const updatedPayjoin = await payjoinProposal.processRes(proposalResponse, proposalRequest);
 
+      const finalPsbt = updatedPayjoin.psbt();
+
+      let totalFee = 0n, receiverFee = 0n;
+      const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
+      if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
+        logger.error(processReceiveSession, 'failed to decode final psbt:', decodedFinalPsbtError);
+      } else {
+        // full fee for the transaction
+        totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
+        logger.debug(processReceiveSession, 'total fee:', totalFee);
+
+        // total the amount of all of our inputs
+        const receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
+          return (
+            input.witness_utxo &&
+            input.witness_utxo.amount &&
+            // this is one our candidate inputs we provided above - i.e. we own it
+            inputs.some((possibleInput) => possibleInput.psbtData.witnessUtxo?.scriptPubKey === input.witness_utxo?.scriptPubKey.hex));
+        }).reduce((acc, input) => {
+          return acc + Utils.btcToSats(input.witness_utxo?.amount || 0);
+        }, 0n);
+        logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
+
+        // get the amount of our output
+        const receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
+          if (output.scriptPubKey.address === receiveSess.address) {
+            return acc + Utils.btcToSats(output.value);
+          }
+          return acc;
+        }, 0n);
+        logger.debug(processReceiveSession, 'total receiver output amount:', receiverTotalOutputAmount);
+
+        // calculate the receiver fee
+        const receiverFee = receiverTotalInputAmount - receiverTotalOutputAmount + receiveSess.amount;
+        logger.debug(processReceiveSession, 'receiver fee:', receiverFee);
+      }
+
       const txid = updatedPayjoin.getTxid();
       logger.debug(processReceiveSession, 'updated proposal txid:', txid);
       if (txid) {
@@ -244,6 +283,8 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           where: { id: receiveSess.id },
           data: {
             txid,
+            fee: totalFee,
+            receiverFee,
           }
         });
         logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);

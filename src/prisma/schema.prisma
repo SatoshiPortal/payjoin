@@ -20,6 +20,7 @@ model Send {
   txid          String?
   address       String?
   fee           BigInt?
+  senderFee     BigInt?       @map("sender_fee")
   callbackUrl   String?       @map("callback_url")
   calledBackTs  DateTime?     @map("called_back_ts")
   expiryTs      DateTime?     @map("expiry_ts")
@@ -43,6 +44,7 @@ model Receive {
   amount        BigInt
   txid          String?
   fee           BigInt?
+  receiverFee   BigInt?       @map("receiver_fee")
   fallbackTxHex String?       @map("fallback_tx_hex")
   callbackUrl   String?       @map("callback_url")
   calledBackTs  DateTime?     @map("called_back_ts")

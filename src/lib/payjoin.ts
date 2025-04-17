@@ -6,6 +6,7 @@ import { ReceiveStatus, SendStatus } from "../types/payjoin";
 import { IRespReceive } from "../types/api/receive";
 import { IRespSend } from "../types/api/send";
 import { cnClient } from "./globals";
+import IRespDecodePsbt from "../types/cyphernode/IRespDecodePsbt";
 
 export async function getOhttpKeys() {
   const ohttpKeys = await PayjoinOhttpKeys.fetch(config.OHTTP_RELAY, config.PAYJOIN_DIRECTORY);
@@ -43,7 +44,7 @@ export async function createSender(bip21: string): Promise<{
   const address = pjUri.address() ?? '';
 
   const { error: feeError, result: feeResult } = await cnClient.getFeeRate({
-    confTarget: 6,
+    confTarget: 1,
   });
   if (feeError || !feeResult) {
     throw new Error(`Failed to get fee rate: ${feeError}`);
@@ -123,4 +124,24 @@ export function appendSendStatus(send: Send) {
     ...Utils.omit(send, ['session']),
     status
   } as IRespSend;
+}
+
+export function extractFeeFromPsbt(decodedPsbt: NonNullable<IRespDecodePsbt['result']>) {
+  if (decodedPsbt.fee) {
+    return Utils.btcToSats(decodedPsbt.fee);
+  }
+
+  // calculate the total input amount
+  const totalInputAmount = decodedPsbt.inputs
+    .filter((input) => input.witness_utxo)
+    .reduce((acc, input) => acc + Utils.btcToSats(input.witness_utxo?.amount || 0), 0n);
+
+  // calculate the total output amount
+  const totalOutputAmount = decodedPsbt.tx.vout
+    .reduce((acc, output) => acc + Utils.btcToSats(output.value || 0), 0n);
+
+  // calculate the fee
+  const fee = totalInputAmount - totalOutputAmount;
+
+  return fee;
 }

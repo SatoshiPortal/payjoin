@@ -78,6 +78,8 @@ import IRespTestMempoolAccept from "../types/cyphernode/IRespTestMempoolAccept";
 import { IReqGetAddressInfo } from "../types/cyphernode/IReqGetAddressInfo";
 import IRespGetAddressInfo from "../types/cyphernode/IRespGetAddressInfo";
 import IRespDecodeScript from "../types/cyphernode/IRespDecodeScript";
+import { IReqDeocdePsbt } from "../types/cyphernode/IReqDeocdePsbt";
+import IRespDecodePsbt from "../types/cyphernode/IRespDecodePsbt";
 
 class CyphernodeClient {
   protected baseURL: string;
@@ -978,6 +980,14 @@ class CyphernodeClient {
     const response = await this._post("/finalizepsbt", params);
 
     return this.handleResponse(response) as IRespFinalizePsbt;
+  }
+
+  async decodePsbt(params: IReqDeocdePsbt): Promise<IRespDecodePsbt> {
+    logger.info("CyphernodeClient.decodePsbt:", params);
+
+    const response = await this._post("/decodepsbt", params);
+
+    return this.handleResponse(response) as IRespDecodePsbt;
   }
 
   async testMempoolAccept(params: IReqTestMempoolAccept): Promise<IRespTestMempoolAccept> {

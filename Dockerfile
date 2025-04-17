@@ -1,8 +1,6 @@
 # Base image for building dependencies
 FROM node:23.1-bookworm-slim AS build-base
 
-COPY pj-ts /payjoin-typescript
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     curl \
@@ -21,11 +19,11 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo --version && rustc --version
 
-
+# git clone and build manually because npm install is failing. tries to use ssh and fails
+# TODO: remove reference to dev branch once changes are merged
+RUN git clone https://github.com/SatoshiPortal/payjoin-typescript.git -b dev
 WORKDIR /payjoin-typescript
 RUN npm install --also=dev
-# temp hack
-#RUN ln -s index.linux-x64-gnu.node index.linux-x64 
 
 WORKDIR /payjoin
 COPY package.json /payjoin

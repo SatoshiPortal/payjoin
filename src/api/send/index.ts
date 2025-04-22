@@ -12,6 +12,7 @@ import { lock, cnClient } from "../../lib/globals";
 export function registerSendApi(): void {
   addJsonRpcMethod('send', send);
   addJsonRpcMethod('cancelSend', cancelSend);
+  addJsonRpcMethod('getSend', getSend);
 }
 
 export async function send(params: IReqSend): Promise<IRespSend> {
@@ -68,7 +69,6 @@ async function cancelSend(params: { id: number }): Promise<{ id: number }> {
 
         const send = await db.send.findUnique({ where: { id } });
 
-        // @toso wrap this in an async-lock on the address to prevent any conflicts with cron - but then we'll need to refetch the record. How to handle????
         if (!send) {
           throw new JSONRPCErrorException('Send session not found', JSONRPCErrorCode.InvalidParams);
         }
@@ -108,6 +108,31 @@ async function cancelSend(params: { id: number }): Promise<{ id: number }> {
       } catch (e) {
         logger.error(cancelSend, 'Failed to cancel send:', e);
         throw new JSONRPCErrorException('Failed to cancel send', JSONRPCErrorCode.InternalError);
+      }
+    })
+    .then(resolve)
+    .catch(reject);
+  });
+}
+
+async function getSend(params: { id: number }): Promise<{ id: number }> {
+  logger.info(getSend, params);
+
+  return new Promise((resolve, reject) => {
+    lock.acquire(params.id.toString(), async () => {
+      try {
+        const { id } = params;
+
+        const send = await db.send.findUnique({ where: { id } });
+
+        if (!send) {
+          throw new JSONRPCErrorException('Send session not found', JSONRPCErrorCode.InvalidParams);
+        }
+
+        return appendSendStatus(send);
+      } catch (e) {
+        logger.error(getSend, 'Failed to get send:', e);
+        throw new JSONRPCErrorException('Failed to get send', JSONRPCErrorCode.InternalError);
       }
     })
     .then(resolve)

@@ -20,10 +20,12 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo --version && rustc --version
 
 # git clone and build manually because npm install is failing. tries to use ssh and fails
-# TODO: remove reference to dev branch once changes are merged
-RUN git clone https://github.com/SatoshiPortal/payjoin-typescript.git -b dev
+RUN git clone https://github.com/SatoshiPortal/payjoin-typescript.git
 WORKDIR /payjoin-typescript
 RUN npm install --also=dev
+# have to install ts separately to resolve linking problems
+RUN npm install --save-dev typescript@5.7.3
+RUN npx tsc
 
 WORKDIR /payjoin
 COPY package.json /payjoin

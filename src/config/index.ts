@@ -24,7 +24,7 @@ export let config: Config = {
   CN_URL: process.env.CN_URL || "https://gatekeeper:2009/v0",
   CN_API_ID: process.env.CN_API_ID || "",
   CN_API_KEY: process.env.CN_API_KEY || "",
-  CRON_INTERVAL: Number(process.env.CRON_INTERVAL  || 60),
+  CRON_INTERVAL: Number(process.env.CRON_INTERVAL  || 30),
   SEND_WALLET: process.env.SEND_WALLET || "01",
   RECEIVE_WALLET: process.env.RECEIVE_WALLET || "01",
   PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",

@@ -1,3 +1,4 @@
+#!/bin/bash
 
 PAYJOIN_VERSION="v0.1.0-local"
 

@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "module": "commonjs", 
+    "esModuleInterop": true,
+    "target": "ES2022",
+    "noImplicitAny": false,
+    "moduleResolution": "node",
+    "sourceMap": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "outDir": "./build",
+    "sourceRoot": "./src",
+  },
+  "types": [
+    "jest",
+    "node"
+  ],
+  "include": ["src/**/*"],
+  "exclude": [
+    "node_modules"
+  ]
+}

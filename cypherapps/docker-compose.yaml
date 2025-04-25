@@ -1,30 +1,58 @@
 version: "3"
 
 services:
+  payjoin-postgres:
+    image: postgres:14.5-bullseye
+    volumes:
+      - "$APP_SCRIPT_PATH/data/pg:/var/lib/postgresql/data"
+      - "$LOGS_DATAPATH:/cnlogs"
+    env_file:
+      - "$APP_SCRIPT_PATH/data/postgres.env"
+    ports:
+      - "0.0.0.0:5432:5432"
+    networks:
+      - cyphernodeappsnet
+    stop_grace_period: 90s
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: 'any'
+        delay: 1s
+      update_config:
+        parallelism: 1
+
   payjoin:
     image: cyphernode/payjoin:v0.1.0-local
     build:
       context: .
       target: prod
     volumes:
-      - "$APP_SCRIPT_PATH/data:/data"
+      - "$APP_SCRIPT_PATH/data://data"
+      - "$APP_SCRIPT_PATH/data/config.env:/payjoin/.env"
+      - "$GATEKEEPER_DATAPATH/certs/cert.pem:/payjoin/cert.pem:ro"
+      - "$APP_SCRIPT_PATH/data/logs:/payjoin/logs"
+    environment:
+      # need this in here because sync-request ignores rejectUnauthorized=false
+    - NODE_TLS_REJECT_UNAUTHORIZED=0
     networks:
       - cyphernodeappsnet
-      - cyphernodenet
 
     restart: always
     labels:
-      - "traefik.docker.network=cyphernodeappsnet,cyphernodenet"
+      - "traefik.docker.network=cyphernodeappsnet"
       - "traefik.frontend.rule=PathPrefixStrip:/payjoin"
       - "traefik.frontend.passHostHeader=true"
       - "traefik.enable=true"
       - "traefik.port=8000"
       - "traefik.frontend.auth.basic.users=<username>:$$2y$$05$$LFKGjKBkmWbI5RUFBqwonOWEcen4Yu.mU139fvD3flWcP8gUqLLaC"
 
+    depends_on:
+      - payjoin-postgres
+
     deploy:
       labels:
         - traefik.enable=true
-        - traefik.docker.network=cyphernodeappsnet,cyphernodenet
+        - traefik.docker.network=cyphernodeappsnet
 
         - traefik.http.routers.payjoin.rule=PathPrefix(`/payjoin`)
         - traefik.http.routers.payjoin.entrypoints=websecure
@@ -52,6 +80,4 @@ services:
 
 networks:
   cyphernodeappsnet:
-    external: true
-  cyphernodenet:
     external: true

@@ -1,0 +1,62 @@
+{
+  "name": "payjoin",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "",
+  "main": "index.js",
+  "prisma": {
+    "schema": "src/prisma/schema.prisma"
+  },
+  "scripts": {
+    "build": "rimraf ./build && tsc",
+    "db:generate": "npx prisma generate",
+    "db:migrate": "npx prisma migrate dev",
+    "db:deploy": "npx prisma generate && npx prisma migrate deploy",
+    "start": "npm run db:deploy && node -r dotenv/config -r tsconfig-paths/register --enable-source-maps build/index.js",
+    "start:dev": "npx prisma migrate dev && ts-node-dev --respawn --transpile-only --ignore-watch node_modules --no-notify -r tsconfig-paths/register -r dotenv/config src/index.ts",
+    "test": "jest --config jest.config.js --forceExit --runInBand",
+    "lint": "eslint . --ext .ts",
+    "lintfix": "eslint . --ext .ts --fix"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^9.13.0",
+    "@types/async-lock": "^1.4.2",
+    "@types/axios": "^0.14.4",
+    "@types/dinero.js": "^1.9.4",
+    "@types/express": "^5.0.0",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.8.4",
+    "@typescript-eslint/eslint-plugin": "^8.12.2",
+    "@typescript-eslint/parser": "^8.12.2",
+    "eslint": "^9.13.0",
+    "eslint-plugin-prettier": "^5.2.1",
+    "globals": "^15.11.0",
+    "jest": "^29.7.0",
+    "prettier": "^3.3.3",
+    "prettier-eslint": "^16.3.0",
+    "prisma": "^6.5.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.12.2"
+  },
+  "dependencies": {
+    "@dinero.js/calculator-bigint": "^2.0.0-alpha.14",
+    "@prisma/client": "^6.5.0",
+    "async-lock": "^1.4.1",
+    "axios": "^1.7.7",
+    "dinero.js": "^2.0.0-alpha.14",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.1",
+    "json-rpc-2.0": "^1.7.0",
+    "payjoin-ts": "https://github.com/SatoshiPortal/payjoin-typescript/tarball/master",
+    "rimraf": "^6.0.1",
+    "sync-request": "^6.1.0",
+    "tslog": "^4.9.3"
+  }
+}

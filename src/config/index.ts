@@ -13,7 +13,7 @@ export interface Config {
   SEND_WALLET: string; // the wallet to use for sending from (e.g. "01", "02", etc)
   RECEIVE_WALLET: string; // the wallet to use for receiving addresses to (e.g. "01", "02", etc)
   PAYJOIN_DIRECTORY: string; // the directory server where the payjoin data is stored
-  PAYJOIN_EXPIRY: bigint; // the number of seconds before a payjoin request expires
+  PAYJOIN_RECEIVE_EXPIRY: bigint; // the number of seconds before a payjoin request expires
   OHTTP_RELAY: string; // the URL of the ohttp relay ( https://pj.bobspacebkk.com, https://ohttp.cakewallet.com, https://pj.benalleng.com )
 } 
 
@@ -28,7 +28,7 @@ export let config: Config = {
   SEND_WALLET: process.env.SEND_WALLET || "01",
   RECEIVE_WALLET: process.env.RECEIVE_WALLET || "01",
   PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",
-  PAYJOIN_EXPIRY: BigInt(process.env.PAYJOIN_EXPIRY  || 3600),
+  PAYJOIN_RECEIVE_EXPIRY: BigInt(process.env.PAYJOIN_RECEIVE_EXPIRY  || 300), // 5 minutes - to be inline roughly with the order expiry
   OHTTP_RELAY: process.env.OHTTP_RELAY || "https://pj.benalleng.com",
 };
 

@@ -44,11 +44,6 @@ export function addJsonRpcMethod(name: string, handler: (params: any) => any) {
 export function registerApi(app: Application): void {
   logger.info('registerApi');
 
-  app.use((req, res, next) => {
-    logger.info(`${req.method} ${req.path}`);
-    next();
-  });
-
   app.use(jsonBigIntMiddleware);
   app.use(express.json());
   app.post('/jsonrpc', jsonRpcMiddleware());

@@ -46,7 +46,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
       amount: params.amount,
       address: params.address,
       callbackUrl: params.callbackUrl,
-      expiryTs: new Date(Date.now() + Number(config.PAYJOIN_EXPIRY) * 1000), // @todo should ideally extract this from the bip21
+      expiryTs: new Date(Date.now() + Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000),
       session: sessionJson
     }
 

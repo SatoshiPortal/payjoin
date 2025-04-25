@@ -22,8 +22,6 @@ export function startCron(config: Config) {
       return;
     }
 
-    logger.info(runJob, "Starting interval");
-
     lock.acquire(lockName, async () => {
       logger.info(runJob, "Lock acquired. Restoring sessions...");
 

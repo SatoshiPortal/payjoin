@@ -1,5 +1,5 @@
 import { config } from "../config";
-import { BtcUri, PayjoinOhttpKeys, PayjoinReceiver, PayjoinSender, PayjoinSenderBuilder } from "payjoin-ts";
+import { BtcUri, PayjoinOhttpKeys, PayjoinReceiver, PayjoinSender, PayjoinSenderBuilder, PayjoinUri } from "payjoin-ts";
 import Utils from "./Utils";
 import { Receive, Send } from "@prisma/client";
 import { ReceiveStatus, SendStatus } from "../types/payjoin";
@@ -21,7 +21,7 @@ export async function createReceiver(address: string, amount: bigint): Promise<{
     config.PAYJOIN_DIRECTORY,
     ohttpKeys,
     config.OHTTP_RELAY,
-    config.PAYJOIN_EXPIRY,
+    config.PAYJOIN_RECEIVE_EXPIRY,
   );
 
   const uriBuilder = receiver.pjUriBuilder().amount(Number(amount));
@@ -34,6 +34,7 @@ export async function createSender(bip21: string): Promise<{
   sender: PayjoinSender, 
   amount: bigint, 
   address: string, 
+  expiry: Date,
   psbt: string 
 }> {
   const bip21Uri = BtcUri.tryFrom(bip21);
@@ -42,6 +43,8 @@ export async function createSender(bip21: string): Promise<{
 
   const amount = BigInt(pjUri.amount() ?? 0);
   const address = pjUri.address() ?? '';
+  const exp = pjUri.exp();
+  const expiry = exp ? new Date(Number(exp) * 1000) : new Date(Date.now() + 3600 * 1000); // default to 1 hour if not set
 
   const { error: feeError, result: feeResult } = await cnClient.getFeeRate({
     confTarget: 1,
@@ -86,6 +89,7 @@ export async function createSender(bip21: string): Promise<{
     sender,
     amount,
     address,
+    expiry,
     psbt,
   }
 }

@@ -54,6 +54,7 @@ model Receive {
   firstSeenTs   DateTime?     @map("first_seen_ts")
   fallbackTs    DateTime?     @map("fallback_broadcast_ts")
   confirmedTs   DateTime?     @map("confirmed_ts")
+  failedTs      DateTime?     @map("failed_ts")
   createdTs     DateTime      @default(now()) @map("created_ts")
   updatedTs     DateTime      @updatedAt @map("updated_ts")
 

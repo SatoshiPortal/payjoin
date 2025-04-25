@@ -23,11 +23,12 @@ export async function send(params: IReqSend): Promise<IRespSend> {
   }
 
   try {
-    const { sender, amount, address, psbt } = await createSender(params.bip21);
+    const { sender, amount, address, expiry, psbt } = await createSender(params.bip21);
 
     logger.debug('sender:', sender);
     logger.debug('amount:', amount);
     logger.debug('address:', address);
+    logger.debug('expiry:', expiry);
     logger.debug('psbt:', psbt);
 
     const sessionJson = sender.toJson();
@@ -38,7 +39,7 @@ export async function send(params: IReqSend): Promise<IRespSend> {
       amount,
       address,
       callbackUrl: params.callbackUrl,
-      expiryTs: new Date(Date.now() + Number(config.PAYJOIN_EXPIRY) * 1000), // @todo should ideally extract this from the bip21
+      expiryTs: expiry,
       session: sessionJson
     }
 

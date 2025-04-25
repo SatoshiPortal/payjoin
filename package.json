@@ -54,7 +54,7 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.1",
     "json-rpc-2.0": "^1.7.0",
-    "payjoin-ts": "https://github.com/SatoshiPortal/payjoin-typescript/tarball/dev",
+    "payjoin-ts": "https://github.com/SatoshiPortal/payjoin-typescript/tarball/master",
     "rimraf": "^6.0.1",
     "sync-request": "^6.1.0",
     "tslog": "^4.9.3"

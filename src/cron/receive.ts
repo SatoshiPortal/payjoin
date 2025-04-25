@@ -17,6 +17,7 @@ const CACHE_TTL = 60000; // 1 minute in milliseconds
 export async function restoreReceiveSessions(config: Config) {
   logger.info(restoreReceiveSessions, 'restoring receive sessions');
 
+  // attempt to process all "current" receive sessions
   const sessions = await db.receive.findMany({
     where: {
       confirmedTs: null,
@@ -31,6 +32,23 @@ export async function restoreReceiveSessions(config: Config) {
 
   for (const receiveSess of sessions) {
     await processReceiveSession(receiveSess, config);
+  }
+
+  // attempt to broadcast any fallback txs that payjoin failed but fallback has not been broadcast
+  const failedSessions = await db.receive.findMany({
+    where: {
+      confirmedTs: null,
+      cancelledTs: null,
+      failedTs: {
+        lte: new Date(Date.now() - 2 * 60 * 1000) // Current date minus 2 minutes
+      },
+      fallbackTxHex: { not: null },
+      txid: null,
+    }
+  });
+  logger.info(restoreReceiveSessions, `found ${failedSessions.length} failed sessions to broadcast`);
+  for (const receiveSess of failedSessions) {
+    await broadcastFallback(receiveSess, config);
   }
 }
 
@@ -67,13 +85,6 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         return;
       }
 
-      await db.receive.update({
-        where: { id: receiveSess.id },
-        data: {
-          fallbackTxHex
-        }
-      });
-
       const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: fallbackTxHex }); 
 
       if (decodeError || !decodeResult) {
@@ -97,7 +108,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       );
 
       // transaction is suitable for broadcast so let's store it for fallback later if we need to
-      await db.receive.update({
+      receiveSess = await db.receive.update({
         where: { id: receiveSess.id },
         data: {
           fallbackTxHex,
@@ -148,15 +159,18 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           return [];
         }
 
+        // sort smallest to largest
+        const sortedUtxos = [...utxosResult.utxos]
+          .filter((utxo) => utxo.confirmations > 0)
+          .sort((a, b) => {
+            return Number(Utils.btcToSats(a.amount) - Utils.btcToSats(b.amount))
+          });
+
         const inputs: any[] = [];
-        for (const utxo of utxosResult.utxos) {
+        for (const utxo of sortedUtxos) {
           const { error: txError, result: txResult } = await cnClient.getTransaction(utxo.txid);
           if (txError || !txResult) {
             logger.error(processReceiveSession, 'failed to get transaction:', txError);
-            continue;
-          }
-          if (txResult.confirmations < 1) {
-            logger.info(processReceiveSession, 'skipping unconfirmed utxo:', utxo);
             continue;
           }
 
@@ -173,7 +187,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
             psbtData: psbtInput
           });
 
-          // @todo we may not want to add *all* inputs - is there a better way to filter them. Perhaps amount based?
+          // limit to 10 inputs to provide to payjoin library
           if (inputs.length >= 10) {
             break;
           }
@@ -228,7 +242,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           }
         });
 
-        await cnClient.lockUnspent({ utxos: lockUtxos, wallet: config.RECEIVE_WALLET });
+        // loop over them and lock individually in case any of them fail
+        for (const utxo of lockUtxos) {
+          await cnClient.lockUnspent({ utxos: [utxo], wallet: config.RECEIVE_WALLET });
+        }
       }
 
       const proposalRequest = await payjoinProposal.extractV2Req();
@@ -292,6 +309,13 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
     } catch (e) {
       logger.error(processReceiveSession, 'failed to restore session:', e);
+
+      await db.receive.update({
+        where: { id: receiveSess.id, failedTs: null },
+        data: {
+          failedTs: new Date(),
+        }
+      });
     }
   });
 }
@@ -448,4 +472,35 @@ function walletProcessPsbt(provisionalPsbt: string, config: Config): string {
     logger.debug(walletProcessPsbt, 'processed psbt:', processResult);
 
     return processResult.psbt;
+}
+
+async function broadcastFallback(receiveSess: Receive, config: Config) {
+  logger.debug(broadcastFallback, 'broadcasting fallback tx for receiveSess:', receiveSess.id);
+
+  if (!receiveSess.fallbackTxHex) {
+    logger.error(broadcastFallback, 'no fallback tx hex found');
+    return;
+  }
+
+  const { error: sendError, result: sendResult } = await cnClient.sendRawTransaction({
+    hex: receiveSess.fallbackTxHex,
+    wallet: config.RECEIVE_WALLET,
+  });
+
+  if (sendError || !sendResult) {
+    logger.error(broadcastFallback, 'failed to broadcast fallback tx:', sendError);
+    return;
+  }
+
+  logger.info(broadcastFallback, 'broadcasted fallback tx:', sendResult);
+
+  // update the receive session with the txid
+  const updatedReceive = await db.receive.update({
+    where: { id: receiveSess.id },
+    data: {
+      txid: sendResult,
+      fallbackTs: new Date(),
+    }
+  });
+  logger.info(broadcastFallback, 'updated receive session with txid:', sendResult, updatedReceive.id);
 }

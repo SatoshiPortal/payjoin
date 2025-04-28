@@ -100,6 +100,10 @@ export function appendReceiveStatus(receive: Receive) {
     status = ReceiveStatus.Expired;
   } else if (receive.confirmedTs) {
     status = ReceiveStatus.Confirmed;
+  } else if (receive.fallbackTs) {
+    status = ReceiveStatus.Fallback;
+  } else if (receive.nonPayjoinTs) {
+    status = ReceiveStatus.NonPayjoin;
   } else if (receive.txid) {
     status = ReceiveStatus.Unconfirmed;
   } else if (receive.cancelledTs) {

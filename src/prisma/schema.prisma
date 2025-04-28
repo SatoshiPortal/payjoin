@@ -53,6 +53,7 @@ model Receive {
   session       String?
   firstSeenTs   DateTime?     @map("first_seen_ts")
   fallbackTs    DateTime?     @map("fallback_broadcast_ts")
+  nonPayjoinTs  DateTime?     @map("non_payjoin_ts")
   confirmedTs   DateTime?     @map("confirmed_ts")
   failedTs      DateTime?     @map("failed_ts")
   createdTs     DateTime      @default(now()) @map("created_ts")

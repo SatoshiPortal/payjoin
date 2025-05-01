@@ -14,21 +14,23 @@ datasource db {
 }
 
 model Send {
-  id            Int           @id @default(autoincrement())
-  bip21         String        @unique
-  amount        BigInt
-  txid          String?
-  address       String?
-  fee           BigInt?
-  senderFee     BigInt?       @map("sender_fee")
-  callbackUrl   String?       @map("callback_url")
-  calledBackTs  DateTime?     @map("called_back_ts")
-  expiryTs      DateTime?     @map("expiry_ts")
-  cancelledTs   DateTime?     @map("cancelled_ts")
-  session       String?
-  confirmedTs   DateTime?     @map("confirmed_ts")
-  createdTs     DateTime      @default(now()) @map("created_ts")
-  updatedTs     DateTime      @updatedAt @map("updated_ts")
+  id                Int           @id @default(autoincrement())
+  bip21             String        @unique
+  amount            BigInt
+  senderInAmount    BigInt?       @map("sender_input_amount")
+  senderOutAmount   BigInt?       @map("sender_output_amount")
+  txid              String?
+  address           String?
+  fee               BigInt?
+  senderFee         BigInt?       @map("sender_fee")
+  callbackUrl       String?       @map("callback_url")
+  calledBackTs      DateTime?     @map("called_back_ts")
+  expiryTs          DateTime?     @map("expiry_ts")
+  cancelledTs       DateTime?     @map("cancelled_ts")
+  session           String?
+  confirmedTs       DateTime?     @map("confirmed_ts")
+  createdTs         DateTime      @default(now()) @map("created_ts")
+  updatedTs         DateTime      @updatedAt @map("updated_ts")
 
   @@index([bip21])
   @@index([address])
@@ -38,26 +40,28 @@ model Send {
 }
 
 model Receive {
-  id            Int           @id @default(autoincrement())
-  bip21         String        @unique
-  address       String        @unique
-  amount        BigInt
-  txid          String?
-  fee           BigInt?
-  receiverFee   BigInt?       @map("receiver_fee")
-  fallbackTxHex String?       @map("fallback_tx_hex")
-  callbackUrl   String?       @map("callback_url")
-  calledBackTs  DateTime?     @map("called_back_ts")
-  expiryTs      DateTime?     @map("expiry_ts")
-  cancelledTs   DateTime?     @map("cancelled_ts")
-  session       String?
-  firstSeenTs   DateTime?     @map("first_seen_ts")
-  fallbackTs    DateTime?     @map("fallback_broadcast_ts")
-  nonPayjoinTs  DateTime?     @map("non_payjoin_ts")
-  confirmedTs   DateTime?     @map("confirmed_ts")
-  failedTs      DateTime?     @map("failed_ts")
-  createdTs     DateTime      @default(now()) @map("created_ts")
-  updatedTs     DateTime      @updatedAt @map("updated_ts")
+  id                  Int           @id @default(autoincrement())
+  bip21               String        @unique
+  address             String        @unique
+  amount              BigInt
+  receiverInAmount    BigInt?       @map("receiver_input_amount")
+  receiverOutAmount   BigInt?       @map("receiver_output_amount")
+  txid                String?
+  fee                 BigInt?
+  receiverFee         BigInt?       @map("receiver_fee")
+  fallbackTxHex       String?       @map("fallback_tx_hex")
+  callbackUrl         String?       @map("callback_url")
+  calledBackTs        DateTime?     @map("called_back_ts")
+  expiryTs            DateTime?     @map("expiry_ts")
+  cancelledTs         DateTime?     @map("cancelled_ts")
+  session             String?
+  firstSeenTs         DateTime?     @map("first_seen_ts")
+  fallbackTs          DateTime?     @map("fallback_broadcast_ts")
+  nonPayjoinTs        DateTime?     @map("non_payjoin_ts")
+  confirmedTs         DateTime?     @map("confirmed_ts")
+  failedTs            DateTime?     @map("failed_ts")
+  createdTs           DateTime      @default(now()) @map("created_ts")
+  updatedTs           DateTime      @updatedAt @map("updated_ts")
 
   @@index([bip21])
   @@index([address])

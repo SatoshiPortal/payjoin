@@ -20,7 +20,6 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
         where: {
           address: data.address,
           confirmedTs: null,
-          cancelledTs: null,
         }
       });
 
@@ -37,7 +36,10 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
           updatedPayjoin = await db.receive.update({
             where: { id: payjoin.id },
             data: {
-              amount: Utils.btcToSats(data.amount), // update the amount here to ensure it matches the fallback tx
+              amount: Utils.btcToSats(data.sent_amount), // update the amount here to ensure it matches the fallback tx
+              receiverFee: 0n, // we contribute no fee in a fallback tx
+              receiverInAmount: 0n,
+              receiverOutAmount: 0n,
             }
           });
         } else {
@@ -46,9 +48,13 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
           updatedPayjoin = await db.receive.update({
             where: { id: payjoin.id },
             data: {
-              amount: Utils.btcToSats(data.amount), // this amount could be anything not matching the payjoin amount
+              amount: Utils.btcToSats(data.sent_amount), // this amount could be anything not matching the payjoin amount
+              receiverFee: 0n, // we contribute no fee in a non-payjoin tx
+              receiverInAmount: 0n,
+              receiverOutAmount: 0n,
               txid: data.txid,
-              cancelledTs: new Date(),
+              nonPayjoinTs: new Date(),
+              cancelledTs: new Date(), // cancel it so we don't process the payjoin
             }
           });
           logger.info(handleAddressCallback, "cancelled receive session");
@@ -64,20 +70,11 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
             await db.receive.update({
               where: { id: payjoin.id },
               data: {
-                nonPayjoinTs: new Date(),
                 calledBackTs: new Date()
               }
             });
           }
         }
-
-        // stop watching the address
-        const watchUrl = addressCallbackUrl(type, data.address);
-        await cnClient.unwatch({
-          address: data.address,
-          unconfirmedCallbackURL: watchUrl,
-          confirmedCallbackURL: watchUrl,
-        });
 
         return;
       }
@@ -118,7 +115,7 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
       }
 
       // stop watching the address if tx is confirmed
-      if (data.confirmations >= 1) {
+      if (updatedPayjoin.confirmedTs) {
         const watchUrl = addressCallbackUrl(type, data.address);
         await cnClient.unwatch({
           address: data.address,

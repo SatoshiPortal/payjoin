@@ -4,6 +4,7 @@ import logger from "../../lib/Log2File";
 import Utils from "../../lib/Utils";
 import { appendReceiveStatus } from "../../lib/payjoin";
 import { lock, cnClient } from "../../lib/globals";
+import { Receive } from "@prisma/client";
 
 export function addressCallbackUrl(type: "send" | "receive", address: string) {
   return `${config.URL_SERVER}:${config.URL_PORT}/${type}/address/${address}`;
@@ -19,7 +20,6 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
         where: {
           address: data.address,
           confirmedTs: null,
-          cancelledTs: null,
         }
       });
 
@@ -29,21 +29,41 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
       }
 
       if (type === "receive" && data.txid !== payjoin.txid) {
-        // this is a non-payjoin transaction
-        logger.info(handleAddressCallback, "non-payjoin transaction detected");
-        const cancelledReceive = await db.receive.update({
-          where: { id: payjoin.id },
-          data: {
-            txid: data.txid,
-            cancelledTs: new Date(),
-          }
-        });
-        logger.info(handleAddressCallback, "cancelled receive session");
+        let updatedPayjoin: Receive;
+        if (payjoin.fallbackTs) {
+          // this is a fallback tx
+          logger.info(handleAddressCallback, "fallback transaction detected");
+          updatedPayjoin = await db.receive.update({
+            where: { id: payjoin.id },
+            data: {
+              amount: Utils.btcToSats(data.sent_amount), // update the amount here to ensure it matches the fallback tx
+              receiverFee: 0n, // we contribute no fee in a fallback tx
+              receiverInAmount: 0n,
+              receiverOutAmount: 0n,
+            }
+          });
+        } else {
+          // this is a non-payjoin transaction
+          logger.info(handleAddressCallback, "non-payjoin transaction detected");
+          updatedPayjoin = await db.receive.update({
+            where: { id: payjoin.id },
+            data: {
+              amount: Utils.btcToSats(data.sent_amount), // this amount could be anything not matching the payjoin amount
+              receiverFee: 0n, // we contribute no fee in a non-payjoin tx
+              receiverInAmount: 0n,
+              receiverOutAmount: 0n,
+              txid: data.txid,
+              nonPayjoinTs: new Date(),
+              cancelledTs: new Date(), // cancel it so we don't process the payjoin
+            }
+          });
+          logger.info(handleAddressCallback, "cancelled receive session");
+        }
 
         // send the callback data
         if (payjoin.callbackUrl) {
           const postData = Utils.sanitizeResponse(
-            appendReceiveStatus(cancelledReceive as unknown as Parameters<typeof appendReceiveStatus>[0])
+            appendReceiveStatus(updatedPayjoin as unknown as Parameters<typeof appendReceiveStatus>[0])
           )
           if (await Utils.post(payjoin.callbackUrl, postData)) {
             logger.info(handleAddressCallback, "callback sent to:", payjoin.callbackUrl);
@@ -55,14 +75,6 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
             });
           }
         }
-
-        // stop watching the address
-        const watchUrl = addressCallbackUrl(type, data.address);
-        await cnClient.unwatch({
-          address: data.address,
-          unconfirmedCallbackURL: watchUrl,
-          confirmedCallbackURL: watchUrl,
-        });
 
         return;
       }
@@ -103,7 +115,7 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
       }
 
       // stop watching the address if tx is confirmed
-      if (data.confirmations >= 1) {
+      if (updatedPayjoin.confirmedTs) {
         const watchUrl = addressCallbackUrl(type, data.address);
         await cnClient.unwatch({
           address: data.address,

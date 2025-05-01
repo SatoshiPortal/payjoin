@@ -1,5 +1,7 @@
 export enum ReceiveStatus {
   Pending = 'pending',
+  Fallback = 'fallback',
+  NonPayjoin = 'non-payjoin',
   Unconfirmed = 'unconfirmed',
   Confirmed = 'confirmed',
   Expired = 'expired',

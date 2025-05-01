@@ -188,7 +188,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           });
 
           // limit to 10 inputs to provide to payjoin library
-          if (inputs.length >= 10) {
+          if (inputs.length >= 20) {
             break;
           }
         }
@@ -258,7 +258,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
       const finalPsbt = updatedPayjoin.psbt();
 
-      let totalFee = 0n, receiverFee = 0n;
+      let totalFee = 0n, receiverFee = 0n, receiverTotalInputAmount = 0n, receiverTotalOutputAmount = 0n;
       const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
       if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
         logger.error(processReceiveSession, 'failed to decode final psbt:', decodedFinalPsbtError);
@@ -268,7 +268,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug(processReceiveSession, 'total fee:', totalFee);
 
         // total the amount of all of our inputs
-        const receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
+        receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
           return (
             input.witness_utxo &&
             input.witness_utxo.amount &&
@@ -280,7 +280,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
 
         // get the amount of our output
-        const receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
+        receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
           if (output.scriptPubKey.address === receiveSess.address) {
             return acc + Utils.btcToSats(output.value);
           }
@@ -293,6 +293,31 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug(processReceiveSession, 'receiver fee:', receiverFee);
       }
 
+      // double chexk that the sent amount matches the amount we expect
+      const calculatedAmount = receiverTotalOutputAmount - receiverTotalInputAmount - receiverFee;
+      let updateAmount = receiveSess.amount;
+      const tolerance = 10n;
+      const difference = calculatedAmount > receiveSess.amount 
+        ? calculatedAmount - receiveSess.amount 
+        : receiveSess.amount - calculatedAmount;
+
+      if (difference > tolerance) {
+        logger.error(
+          processReceiveSession, 
+          `calculated amount differs from expected by ${difference} sats (more than ${tolerance} tolerance): ` +
+          `calculated=${calculatedAmount}, expected=${receiveSess.amount}`
+        );
+        // set to update the payjoin amount
+        updateAmount = calculatedAmount;
+      } else if (difference > 0n) {
+        // Amounts differ but within tolerance
+        logger.info(
+          processReceiveSession, 
+          `calculated amount differs from expected by ${difference} sats (within ${tolerance} tolerance): ` +
+          `calculated=${calculatedAmount}, expected=${receiveSess.amount}`
+        );
+      }
+
       const txid = updatedPayjoin.getTxid();
       logger.debug(processReceiveSession, 'updated proposal txid:', txid);
       if (txid) {
@@ -300,8 +325,11 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           where: { id: receiveSess.id },
           data: {
             txid,
+            amount: updateAmount,
             fee: totalFee,
             receiverFee,
+            receiverInAmount: receiverTotalInputAmount,
+            receiverOutAmount: receiverTotalOutputAmount,
           }
         });
         logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);
@@ -315,6 +343,8 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         data: {
           failedTs: new Date(),
         }
+      }).catch((e) => {
+        logger.error(processReceiveSession, 'failed to update session with failed timestamp:', e);
       });
     }
   });

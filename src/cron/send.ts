@@ -106,7 +106,7 @@ export async function processSendSession(sendSess: Send) {
           return;
         }
 
-        let totalFee = 0n, senderFee = 0n;
+        let totalFee = 0n, senderFee = 0n, senderTotalInputAmount = 0n, senderTotalOutputAmount = 0n;
         const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: processedResult.psbt! });
         if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
           logger.error(processSendSession, 'failed to decode final psbt:', decodedFinalPsbtError);
@@ -116,7 +116,7 @@ export async function processSendSession(sendSess: Send) {
           logger.debug(processSendSession, 'total fee:', totalFee);
 
           // total amount of all our inputs
-          const senderTotalInputAmount = decodedFinalPsbtResult.inputs
+          senderTotalInputAmount = decodedFinalPsbtResult.inputs
             .filter((input) => 
               input.witness_utxo && 
               input.witness_utxo.scriptPubKey.address && 
@@ -126,7 +126,7 @@ export async function processSendSession(sendSess: Send) {
           logger.debug(processSendSession, 'total sender input amount:', senderTotalInputAmount);
 
           // get the amount of our output
-          const senderTotalOutputAmount = decodedFinalPsbtResult.tx.vout
+          senderTotalOutputAmount = decodedFinalPsbtResult.tx.vout
             .filter((output) => 
               output.scriptPubKey.address && 
               isAddressOwned(output.scriptPubKey.address, config)
@@ -146,6 +146,8 @@ export async function processSendSession(sendSess: Send) {
               txid: sendResult,
               fee: totalFee,
               senderFee,
+              senderInAmount: senderTotalInputAmount,
+              senderOutAmount: senderTotalOutputAmount,
             }
           });
   

@@ -1,16 +1,18 @@
 import { PayjoinSender } from "payjoin-ts";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
-import { Config, config } from "../config";
+import { Config } from "../config";
 import { Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { extractFeeFromPsbt } from "../lib/payjoin";
 
-export async function restoreSendSessions() {
+export async function restoreSendSessions(config: Config) {
   logger.info(restoreSendSessions, 'restoring send sessions');
 
-  const sessions = await db.send.findMany({
+  const { replicaId, totalReplicas } = Utils.replicaInfo();
+
+  const allSessions = await db.send.findMany({
     where: {
       confirmedTs: null,
       cancelledTs: null,
@@ -20,14 +22,17 @@ export async function restoreSendSessions() {
       session: { not: null },
     }
   });
+  const sessions = allSessions.filter(session => {
+    return session.id % totalReplicas === (replicaId - 1);
+  });
   logger.info(restoreSendSessions, `found ${sessions.length} sessions to restore`);
 
   for (const sendSess of sessions) {
-    await processSendSession(sendSess);
+    await processSendSession(sendSess, config);
   }
 } 
 
-export async function processSendSession(sendSess: Send) {
+export async function processSendSession(sendSess: Send, config: Config) {
   // lock on both id and address - cancel uses id, watch uses address
   await lock.acquire([sendSess.id.toString(), sendSess.address!], async () => {
     logger.info(processSendSession, 'restoring session:', sendSess.id);

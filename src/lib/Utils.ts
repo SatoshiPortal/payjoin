@@ -140,6 +140,13 @@ class Utils {
   static jsonStringify(obj: any, pretty: boolean = false): string {
     return JSON.stringify(obj, Utils.jsonReplacer, pretty ? 2 : 0);
   }
+
+  static replicaInfo(): { replicaId: number; totalReplicas: number } {
+    const replicaId = isNaN(parseInt(process.env.REPLICA_NUMBER || '1')) ? 1 : parseInt(process.env.REPLICA_NUMBER || '1');
+    const totalReplicas = isNaN(parseInt(process.env.TOTAL_REPLICAS || '1')) ? 1 : parseInt(process.env.TOTAL_REPLICAS || '1');
+
+    return { replicaId, totalReplicas };
+  }
 }
 
 export default Utils;

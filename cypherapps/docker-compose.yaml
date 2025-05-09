@@ -34,6 +34,8 @@ services:
     environment:
       # need this in here because sync-request ignores rejectUnauthorized=false
     - NODE_TLS_REJECT_UNAUTHORIZED=0
+    - REPLICA_NUMBER={{.Task.Slot}}
+    - TOTAL_REPLICAS=1
     networks:
       - cyphernodeappsnet
 

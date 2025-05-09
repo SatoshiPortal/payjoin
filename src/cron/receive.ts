@@ -17,8 +17,10 @@ const CACHE_TTL = 60000; // 1 minute in milliseconds
 export async function restoreReceiveSessions(config: Config) {
   logger.info(restoreReceiveSessions, 'restoring receive sessions');
 
+  const { replicaId, totalReplicas } = Utils.replicaInfo();
+
   // attempt to process all "current" receive sessions
-  const sessions = await db.receive.findMany({
+  const allSessions = await db.receive.findMany({
     where: {
       confirmedTs: null,
       cancelledTs: null,
@@ -28,6 +30,9 @@ export async function restoreReceiveSessions(config: Config) {
       session: { not: null }
     }
   });
+  const sessions = allSessions.filter(session => {
+    return session.id % totalReplicas === (replicaId - 1);
+  });
   logger.info(restoreReceiveSessions, `found ${sessions.length} sessions to restore`);
 
   for (const receiveSess of sessions) {
@@ -35,7 +40,7 @@ export async function restoreReceiveSessions(config: Config) {
   }
 
   // attempt to broadcast any fallback txs that payjoin failed but fallback has not been broadcast
-  const failedSessions = await db.receive.findMany({
+  const allFailedSessions = await db.receive.findMany({
     where: {
       confirmedTs: null,
       cancelledTs: null,
@@ -45,6 +50,9 @@ export async function restoreReceiveSessions(config: Config) {
       fallbackTxHex: { not: null },
       txid: null,
     }
+  });
+  const failedSessions = allFailedSessions.filter(session => {
+    return session.id % totalReplicas === (replicaId - 1);
   });
   logger.info(restoreReceiveSessions, `found ${failedSessions.length} failed sessions to broadcast`);
   for (const receiveSess of failedSessions) {

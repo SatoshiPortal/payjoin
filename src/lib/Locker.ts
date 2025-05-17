@@ -8,6 +8,12 @@ import { isStubMode } from "./StubMode";
 export class LockManager {
   private _prisma: PrismaClient;
   private _defaultTimeout: number;
+  // Special reserved lock IDs for null and undefined keys
+  private readonly NULL_LOCK_ID = 1;
+  private readonly UNDEFINED_LOCK_ID = 2;
+
+  // In-memory tracking of locks acquired by this connection
+  private static _connectionLocks: Map<number, boolean> = new Map();
 
   constructor(defaultTimeout: number = 60000) {
     this._prisma = new PrismaClient();
@@ -17,21 +23,28 @@ export class LockManager {
   /**
    * Checks if a named lock is currently being held by any process
    *
-   * @param lockName - Unique name for the lock
+   * @param lockName - Unique name for the lock (or null)
    * @returns Promise<boolean> - true if the lock is busy, false if it's available
    */
-  async isBusy(lockName: string): Promise<boolean> {
+  async isBusy(lockName: string | null | undefined): Promise<boolean> {
     if (isStubMode()) {
       logger.debug(
-        `[LockManager] isBusy :: Stub mode is enabled, reporting lock "${lockName}" as not busy`,
+        `[LockManager] isBusy :: Stub mode is enabled, reporting lock "${String(
+          lockName,
+        )}" as not busy`,
       );
       return false;
     }
-  
-    const lockId = this.hashStringToInt(lockName);
-  
+
+    const lockId = this.getLockId(lockName);
+
+    // Check in-memory first for same-connection locks
+    if (LockManager._connectionLocks.has(lockId)) {
+      return true;
+    }
+
     try {
-      // Directly query pg_locks to see if anyone holds this lock
+      // Then check PostgreSQL for cross-connection locks
       const result = await this._prisma.$queryRaw<{ count: string }[]>`
         SELECT COUNT(*) as count
         FROM pg_locks
@@ -39,15 +52,19 @@ export class LockManager {
         AND (classid = 0 AND objid = ${lockId})
         AND granted = true;
       `;
-  
+
       const lockCount = parseInt(result[0].count, 10);
       const isBusy = lockCount > 0;
-      
-      logger.debug(`[LockManager] Lock "${lockName}" is ${isBusy ? 'busy' : 'available'} (count: ${lockCount})`);
-      
+
+      logger.debug(
+        `[LockManager] Lock "${String(lockName)}" is ${
+          isBusy ? "busy" : "available"
+        } (count: ${lockCount})`,
+      );
+
       return isBusy;
     } catch (error) {
-      logger.error(`[LockManager] Error checking lock status for "${lockName}":`, error);
+      logger.error(`[LockManager] Error checking lock status for "${String(lockName)}":`, error);
       return true; // Assume busy on error
     }
   }
@@ -57,16 +74,24 @@ export class LockManager {
    * This is a blocking operation that will wait until all locks are available
    * Locks are acquired in a deterministic order to prevent deadlocks
    *
-   * @param lockNames - Single lock name or array of lock names
+   * @param lockNames - Single lock name (or null) or array of lock names
    * @param callback - Function to execute while holding the lock(s)
    * @param timeout - Optional timeout in milliseconds (defaults to 60000)
    * @returns Result of the callback function
    */
   async acquire<T>(
-    lockNames: string | string[],
+    lockNames: string | string[] | null | undefined,
     callback: () => Promise<T>,
     timeout?: number,
   ): Promise<T> {
+    // Handle special cases: null or undefined
+    // if (lockNames === null || lockNames === undefined) {
+    //   logger.debug(
+    //     `[LockManager] Acquiring special lock: ${lockNames === null ? "null" : "undefined"}`,
+    //   );
+    //   return this.acquireSingleLock(lockNames, callback, timeout);
+    // }
+
     // Convert single lock name to array for consistent handling
     const locks = Array.isArray(lockNames) ? lockNames : [lockNames];
 
@@ -86,7 +111,7 @@ export class LockManager {
 
     // Sort locks by name to ensure consistent acquisition order and prevent deadlocks
     const sortedLocks = [...locks].sort();
-    const lockIds = sortedLocks.map(name => this.hashStringToInt(name));
+    const lockIds = sortedLocks.map(name => this.getLockId(name));
 
     logger.debug(
       `[LockManager] Waiting to acquire ${lockIds.length} locks: ${sortedLocks.join(", ")}`,
@@ -123,14 +148,30 @@ export class LockManager {
           throw new Error(`Locks acquisition timed out after ${actualTimeout}ms`);
         }
 
-        // Acquire this specific lock
+        logger.debug(
+          `[LockManager] Attempting to acquire lock "${String(lockName)}" (${i + 1}/${
+            lockIds.length
+          })`,
+        );
+
+        // First check if we already have this lock in our own connection
+        if (LockManager._connectionLocks.has(lockId)) {
+          // Need to wait for our own connection to release this lock
+          await this.waitForLocalLockRelease(lockId, actualTimeout - (Date.now() - startTime));
+        }
+
+        // Acquire this specific lock in PostgreSQL
         await this._prisma.$queryRaw`
           SELECT (pg_advisory_lock(${lockId}) IS NOT NULL)::text as locked
         `;
 
-        // Remember that we acquired this lock
+        // Track the lock both in the release list for this call and in the connection locks
         acquiredLockIds.push(lockId);
-        logger.debug(`[LockManager] Acquired lock "${lockName}" (${i + 1}/${lockIds.length})`);
+        LockManager._connectionLocks.set(lockId, true);
+
+        logger.debug(
+          `[LockManager] Acquired lock "${String(lockName)}" (${i + 1}/${lockIds.length})`,
+        );
       }
 
       // Check if timeout occurred during lock acquisition
@@ -161,16 +202,60 @@ export class LockManager {
           const lockName = sortedLocks[i];
 
           try {
+            // Remove from our in-memory tracking
+            LockManager._connectionLocks.delete(lockId);
+
+            // Release in PostgreSQL
             await this._prisma.$queryRaw`
               SELECT (pg_advisory_unlock(${lockId}))::text as released
             `;
-            logger.debug(`[LockManager] Released lock "${lockName}"`);
+            logger.debug(`[LockManager] Released lock "${String(lockName)}"`);
           } catch (unlockError) {
-            logger.error(`[LockManager] Failed to release lock "${lockName}":`, unlockError);
+            logger.error(
+              `[LockManager] Failed to release lock "${String(lockName)}":`,
+              unlockError,
+            );
           }
         }
         logger.debug(`[LockManager] Released all ${acquiredLockIds.length} locks`);
       }
+    }
+  }
+
+  /**
+   * Wait for a local lock to be released with a polling mechanism
+   */
+  private async waitForLocalLockRelease(lockId: number, timeoutMs: number): Promise<void> {
+    const startTime = Date.now();
+    const pollIntervalMs = 50; // Poll every 50ms
+
+    logger.debug(`[LockManager] Waiting for local lock ${lockId} to be released...`);
+
+    while (LockManager._connectionLocks.has(lockId)) {
+      // Check if we've timed out
+      if (Date.now() - startTime > timeoutMs) {
+        throw new Error(
+          `Timeout waiting for local lock ${lockId} to be released after ${timeoutMs}ms`,
+        );
+      }
+
+      // Wait a bit before checking again
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+
+    logger.debug(`[LockManager] Local lock ${lockId} is now available`);
+  }
+
+  /**
+   * Gets the lock ID for the given lock name, handling null and undefined
+   */
+  private getLockId(lockName: string | null | undefined): number {
+    if (lockName === null) {
+      return this.NULL_LOCK_ID;
+    } else if (lockName === undefined) {
+      return this.UNDEFINED_LOCK_ID;
+    } else {
+      return this.hashStringToInt(lockName);
     }
   }
 
@@ -185,7 +270,15 @@ export class LockManager {
       hash |= 0; // Convert to 32bit integer
     }
 
-    return Math.abs(hash);
+    // Ensure we don't collide with the special NULL/UNDEFINED lock IDs
+    const absHash = Math.abs(hash);
+
+    // Avoid collisions with reserved IDs 1 and 2
+    if (absHash === this.NULL_LOCK_ID || absHash === this.UNDEFINED_LOCK_ID) {
+      return absHash + 1000; // Add a large offset to avoid collisions
+    }
+
+    return absHash || 3; // Ensure non-zero (0 hash becomes 3)
   }
 }
 

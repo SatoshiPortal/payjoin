@@ -31,6 +31,15 @@ export async function send(params: IReqSend): Promise<IRespSend> {
     logger.debug('expiry:', expiry);
     logger.debug('psbt:', psbt);
 
+    // Check if the expiry has already passed
+    if (expiry && expiry < new Date()) {
+      logger.error(send, `bip21 already expired at ${expiry.toISOString()}`);
+      throw new JSONRPCErrorException(
+        'bip21 has already expired', 
+        JSONRPCErrorCode.InvalidParams
+      );
+    }
+
     const sessionJson = sender.toJson();
     logger.debug('sessionJson:', sessionJson);
 
@@ -43,7 +52,7 @@ export async function send(params: IReqSend): Promise<IRespSend> {
       session: sessionJson
     }
 
-    const send = await db.send.create({ data });
+    const sendRecord = await db.send.create({ data });
 
     // watch the address for non-payjoin transactions
     const watchUrl = addressCallbackUrl('send', address);
@@ -53,10 +62,14 @@ export async function send(params: IReqSend): Promise<IRespSend> {
       confirmedCallbackURL: watchUrl,
     });
 
-    return appendSendStatus(send);
+    return appendSendStatus(sendRecord);
   } catch (e) {
-    logger.error(send, 'Failed to send:', e);
-    throw new JSONRPCErrorException('Failed to send', JSONRPCErrorCode.InternalError, e);
+    if (e instanceof JSONRPCErrorException) {
+      throw e;
+    } else {
+      logger.error(send, 'Failed to send:', e);
+      throw new JSONRPCErrorException('Failed to send', JSONRPCErrorCode.InternalError, e);
+    }
   }
 }
 

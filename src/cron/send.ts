@@ -80,8 +80,7 @@ export async function processSendSession(sendSess: Send, config: Config) {
         }
 
         logger.debug(processSendSession, 'Received proposal PSBT');
-        const psbt = outcome.inner.inner;
-        const psbtBase64 = psbt.serializeBase64();
+        const psbtBase64 = outcome.inner.psbtBase64;
 
         const { error: processedError, result: processedResult } = await cnClient.processPsbt({
           psbt: psbtBase64,

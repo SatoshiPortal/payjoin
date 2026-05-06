@@ -1,5 +1,5 @@
 import { config } from "../config";
-import { payjoin, bitcoin } from "payjoin";
+import { payjoin } from "payjoin";
 import Utils from "./Utils";
 import { Receive, Send } from "@prisma/client";
 import { ReceiveStatus, SendStatus } from "../types/payjoin";
@@ -56,27 +56,14 @@ export function arrayBufferToHex(buffer: ArrayBuffer): string {
     return hexCodes.join('');
 }
 
-export function getNetwork(): bitcoin.Network {
-  const networkMap: Record<string, bitcoin.Network> = {
-    'Bitcoin': bitcoin.Network.Bitcoin,
-    'Testnet': bitcoin.Network.Testnet,
-    'Testnet4': bitcoin.Network.Testnet4,
-    'Signet': bitcoin.Network.Signet,
-    'Regtest': bitcoin.Network.Regtest,
-  };
-  return networkMap[config.BITCOIN_NETWORK] ?? bitcoin.Network.Regtest;
-}
-
 export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string }> {
   logger.info(createReceiver, `Creating receiver for address: ${address} amount: ${amount}`);
 
   const ohttpKeys = await getOhttpKeys();
 
-  const receiveAddress = new bitcoin.Address(address, getNetwork());
-
   const persister = new ReceiverPersister({ id, db });
 
-  const receiver = new payjoin.ReceiverBuilder(receiveAddress, config.PAYJOIN_DIRECTORY, ohttpKeys)
+  const receiver = new payjoin.ReceiverBuilder(address, config.PAYJOIN_DIRECTORY, ohttpKeys)
     .withAmount(amount)
     .withExpiration(config.PAYJOIN_RECEIVE_EXPIRY)
     .build()

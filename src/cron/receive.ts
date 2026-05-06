@@ -1,11 +1,11 @@
-import { payjoin, bitcoin } from "payjoin";
+import { payjoin } from "payjoin";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
 import { Config } from "../config";
 import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse, getNetwork } from "../lib/payjoin";
+import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 
@@ -150,7 +150,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
         const sessionNewInputs = new Set<string>();
         receiver = receiver.checkNoInputsSeenBefore(
-          { callback: (outpoint: bitcoin.OutPoint) => isKnown(outpoint, receiveSess.bip21!, sessionNewInputs) }
+          { callback: (outpoint: payjoin.PlainOutPoint) => isKnown(outpoint, receiveSess.bip21!, sessionNewInputs) }
         ).save(persister);
 
         // save any new "seen" inputs to the database and add to cache
@@ -168,7 +168,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
         if (fallbackTx) {
           logger.debug(processReceiveSession, 'got fallback tx from session history:', fallbackTx);
-          const fallbackTxHex = arrayBufferToHex(fallbackTx.serialize());
+          const fallbackTxHex = arrayBufferToHex(fallbackTx);
 
           const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: fallbackTxHex }); 
 
@@ -237,7 +237,11 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           const { error: addrError, result: addrResult } = await cnClient.getnewaddress({ wallet: config.RECEIVE_WALLET });
           if (!addrError && addrResult?.address) {
             try {
-              const freshScript = new bitcoin.Address(addrResult.address, getNetwork()).scriptPubkey();
+              const { error: addrInfoError, result: addrInfoResult } = await cnClient.getAddressInfo({ address: addrResult.address, wallet: config.RECEIVE_WALLET });
+              if (addrInfoError || !addrInfoResult?.scriptPubKey) {
+                throw new Error(`Failed to get scriptPubKey for address: ${addrResult.address}`);
+              }
+              const freshScript = new Uint8Array(Buffer.from(addrInfoResult.scriptPubKey, 'hex')).buffer;
               receiver = receiver.substituteReceiverScript(freshScript).commitOutputs().save(persister);
               effectiveReceiverAddress = addrResult.address;
               logger.info(processReceiveSession, 'substituted receiver output to fresh address:', addrResult.address);
@@ -505,7 +509,7 @@ function isOwned(script: ArrayBuffer, config: Config): boolean {
   return false;
 }
 
-function isKnown(outpoint: bitcoin.OutPoint, currentBip21: string, newInputs: Set<string>): boolean {
+function isKnown(outpoint: payjoin.PlainOutPoint, currentBip21: string, newInputs: Set<string>): boolean {
   logger.debug(isKnown, 'checking if outpoint is known:', outpoint);
 
   const outpointKey = `${outpoint.txid}:${outpoint.vout}`;
@@ -612,23 +616,21 @@ async function availableInputs(config: Config): Promise<InputPairWithMetadata[]>
       continue;
     }
 logger.debug(availableInputs, 'got transaction for utxo:', txResult);
-    const txin = bitcoin.TxIn.create({
-      previousOutput: bitcoin.OutPoint.create({
+    const txin = payjoin.PlainTxIn.create({
+      previousOutput: payjoin.PlainOutPoint.create({
         txid: utxo.txid,
         vout: utxo.vout,
       }),
-      scriptSig: new bitcoin.Script(new Uint8Array([]).buffer),
+      scriptSig: new Uint8Array([]).buffer,
       sequence: 0,
       witness: [],
     });
 
-    const txOut = bitcoin.TxOut.create({
-      value: bitcoin.Amount.fromBtc(utxo.amount),
-      scriptPubkey: new bitcoin.Script(
-        new Uint8Array(Buffer.from(utxo.scriptPubKey, "hex")).buffer,
-      ),
+    const txOut = payjoin.PlainTxOut.create({
+      valueSat: Utils.btcToSats(utxo.amount),
+      scriptPubkey: new Uint8Array(Buffer.from(utxo.scriptPubKey, "hex")).buffer,
     });
-    const psbtIn = payjoin.PsbtInput.create({
+    const psbtIn = payjoin.PlainPsbtInput.create({
         witnessUtxo: txOut,
         redeemScript: undefined,
         witnessScript: undefined,

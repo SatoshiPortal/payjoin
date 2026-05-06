@@ -51,10 +51,13 @@
     "dinero.js": "^2.0.0-alpha.14",
     "dotenv": "^16.4.7",
     "express": "^4.21.1",
+    "https-proxy-agent": "^7.0.6",
     "json-rpc-2.0": "^1.7.0",
-    "payjoin-ts": "https://github.com/SatoshiPortal/payjoin-typescript/tarball/master",
+    "payjoin": "^0.1.0",
+    "pg": "^8.20.0",
     "rimraf": "^6.0.1",
     "sync-request": "^6.1.0",
-    "tslog": "^4.9.3"
+    "tslog": "^4.9.3",
+    "uniffi-bindgen-react-native": "github:spacebear21/uniffi-bindgen-react-native#tsconfig-module-nodenext"
   }
 }

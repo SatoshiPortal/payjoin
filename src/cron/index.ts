@@ -21,22 +21,20 @@ export function startCron(config: Config) {
 
   const runJob = async (config: Config) => {
     if (await lock.isBusy(replicaLockName)) {
-      logger.info(runJob, "Previous interval is still running");
+      logger.info(runJob, `Previous interval is still running: ${replicaLockName}. Skipping this run.`);
       return;
     }
 
-    lock.acquire(replicaLockName, async () => {
-      logger.info(runJob, "Lock acquired. Restoring sessions...");
-
-      try {
+    try {
+      await lock.acquire(replicaLockName, async () => {
+        logger.info(runJob, "Lock acquired. Restoring sessions...");
         await restoreSendSessions(config);
         await restoreReceiveSessions(config);
-      } catch (e) {
-        logger.error(runJob, "Failed to restore sessions:", e);
-      }
-
-      logger.info(runJob, "Sessions processed. Releasing lock");
-    });
+        logger.info(runJob, "Sessions processed. Releasing lock");
+      });
+    } catch (e) {
+      logger.error(runJob, "Failed to run job:", e);
+    }
   };
 
   activeInterval = setInterval(() => runJob(config), interval * 1000);

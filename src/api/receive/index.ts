@@ -38,19 +38,23 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
   }
 
   try {
-    const { bip21, receiver } = await createReceiver(params.address, params.amount);
-    const sessionJson = receiver.toJson();
-
     const data = {
-      bip21,
       amount: params.amount,
       address: params.address,
       callbackUrl: params.callbackUrl,
       expiryTs: new Date(Date.now() + Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000),
-      session: sessionJson
     }
 
-    const receive = await db.receive.create({ data });
+    let receive = await db.receive.create({ data });
+
+    const { bip21 } = await createReceiver({ id: receive.id, address: params.address, amount: BigInt(params.amount) });
+
+    receive = await db.receive.update({
+      where: { id: receive.id },
+      data: {
+        bip21,
+      }
+    });
 
     // watch the address for non-payjoin transactions
     const watchUrl = addressCallbackUrl('receive', params.address);
@@ -60,8 +64,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
       confirmedCallbackURL: watchUrl,
     });
 
-    // Use type assertion to handle null vs undefined discrepancy
-    return appendReceiveStatus(receive as unknown as Parameters<typeof appendReceiveStatus>[0]);
+    return appendReceiveStatus(receive);
   } catch (e) {
     logger.error(receive, 'Failed to receive:', e);
     throw new JSONRPCErrorException('Failed to receive', JSONRPCErrorCode.InternalError);
@@ -115,6 +118,7 @@ async function cancelReceive(params: { id: number }): Promise<{ id: number }> {
 
         return { id };
       } catch (e) {
+        if (e instanceof JSONRPCErrorException) throw e;
         logger.error(cancelReceive, 'Failed to cancel receive:', e);
         throw new JSONRPCErrorException('Failed to cancel receive', JSONRPCErrorCode.InternalError);
       }

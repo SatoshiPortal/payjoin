@@ -15,7 +15,9 @@ export interface Config {
   PAYJOIN_DIRECTORY: string; // the directory server where the payjoin data is stored
   PAYJOIN_RECEIVE_EXPIRY: bigint; // the number of seconds before a payjoin request expires
   OHTTP_RELAY: string; // the URL of the ohttp relay ( https://pj.bobspacebkk.com, https://ohttp.cakewallet.com, https://pj.benalleng.com )
-} 
+  BITCOIN_NETWORK: string; // Bitcoin | Testnet | Testnet4 | Signet | Regtest
+  OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
+}
 
 export let config: Config = {
   BASE_DIR: process.env.BASE_DIR || "/payjoin",
@@ -29,7 +31,9 @@ export let config: Config = {
   RECEIVE_WALLET: process.env.RECEIVE_WALLET || "01",
   PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",
   PAYJOIN_RECEIVE_EXPIRY: BigInt(process.env.PAYJOIN_RECEIVE_EXPIRY  || 300), // 5 minutes - to be inline roughly with the order expiry
-  OHTTP_RELAY: process.env.OHTTP_RELAY || "https://pj.benalleng.com",
+  OHTTP_RELAY: process.env.OHTTP_RELAY || "https://ohttp.cakewallet.com",
+  BITCOIN_NETWORK: process.env.BITCOIN_NETWORK || "Regtest",
+  OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
 };
 
 export function reloadConfig(): Config {

@@ -41,7 +41,7 @@ model Send {
 
 model Receive {
   id                  Int           @id @default(autoincrement())
-  bip21               String        @unique
+  bip21               String?       @unique
   address             String        @unique
   amount              BigInt
   receiverInAmount    BigInt?       @map("receiver_input_amount")

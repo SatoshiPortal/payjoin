@@ -1,11 +1,12 @@
-import { PayjoinSender } from "payjoin-ts";
+import { payjoin } from "payjoin";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
 import { Config } from "../config";
 import { Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { extractFeeFromPsbt } from "../lib/payjoin";
+import { extractFeeFromPsbt, fetchBufferResponse } from "../lib/payjoin";
+import { SenderPersister } from "../lib/persister";
 
 export async function restoreSendSessions(config: Config) {
   logger.info(restoreSendSessions, 'restoring send sessions');
@@ -27,13 +28,12 @@ export async function restoreSendSessions(config: Config) {
   });
   logger.info(restoreSendSessions, `found ${sessions.length} sessions to restore`);
 
-  for (const sendSess of sessions) {
-    await processSendSession(sendSess, config);
-  }
-} 
+  await Promise.all(
+    sessions.map(sendSess => processSendSession(sendSess, config))
+  );
+}
 
 export async function processSendSession(sendSess: Send, config: Config) {
-  // lock on both id and address - cancel uses id, watch uses address
   await lock.acquire([sendSess.id.toString(), sendSess.address!], async () => {
     logger.info(processSendSession, 'restoring session:', sendSess.id);
 
@@ -43,36 +43,51 @@ export async function processSendSession(sendSess: Send, config: Config) {
     }
 
     try {
-      const restoredSender = PayjoinSender.fromJson(sendSess.session!);
-      logger.debug(processSendSession, 'restored sender successfully');
+      const persister = new SenderPersister({ id: sendSess.id, db });
+      persister.restore(JSON.parse(sendSess.session!));
 
-      const request = await restoredSender.extractV2(config.OHTTP_RELAY);
-      logger.debug(processSendSession, 'extractV2 request complete');
+      const replayResult = payjoin.replaySenderEventLog(persister);
+      const sessionState = replayResult.state();
 
-      const responseBytes = await request.post();
-      const response = await request.processResponse(responseBytes);
-      logger.debug(processSendSession, 'post request. Got response');
+      if (payjoin.SendSession.WithReplyKey.instanceOf(sessionState)) {
+        logger.debug(processSendSession, 'Sender is in WithReplyKey state — sending initial V2 post');
 
-      const v2Context = response.v2Context();
-      if (!v2Context) {
-        logger.error(processSendSession, 'v2Context is null. Try again later');
+        const sender = sessionState.inner.inner;
+        const { request, ohttpCtx } = sender.createV2PostRequest(config.OHTTP_RELAY);
+        const responseBuffer = await fetchBufferResponse(request);
+        sender.processResponse(responseBuffer, ohttpCtx).save(persister);
+
+        logger.info(processSendSession, 'Initial V2 post complete — session advanced to PollingForProposal');
         return;
       }
-      logger.debug(processSendSession, 'v2context complete');
 
-      const finalRequest = await v2Context.extractRequest(config.OHTTP_RELAY);
-      logger.debug(processSendSession, 'extractRequest got final request');
+      if (payjoin.SendSession.PollingForProposal.instanceOf(sessionState)) {
+        logger.debug(processSendSession, 'Sender is in PollingForProposal state — polling for proposal');
 
-      const finalResponseBytes = await finalRequest.post();
-      const finalResponse = await v2Context.processResponse(finalResponseBytes, finalRequest);
+        const sender = sessionState.inner.inner;
+        const { request, ohttpCtx } = sender.createPollRequest(config.OHTTP_RELAY);
+        const responseBuffer = await fetchBufferResponse(request);
+        const outcome = sender.processResponse(responseBuffer, ohttpCtx).save(persister);
 
-      if (finalResponse && finalResponse.length > 0) {
-        // at this point we assume it is a psbt. We'll try to process, finalize and broadcast
+        if (payjoin.PollingForProposalTransitionOutcome.Stasis.instanceOf(outcome)) {
+          logger.info(processSendSession, 'No proposal received yet — will try again next poll');
+          return;
+        }
+
+        if (!payjoin.PollingForProposalTransitionOutcome.Progress.instanceOf(outcome)) {
+          logger.error(processSendSession, 'Unexpected PollingForProposal outcome:', outcome);
+          return;
+        }
+
+        logger.debug(processSendSession, 'Received proposal PSBT');
+        const psbt = outcome.inner.inner;
+        const psbtBase64 = psbt.serializeBase64();
+
         const { error: processedError, result: processedResult } = await cnClient.processPsbt({
-          psbt: finalResponse,
-          finalize: true, 
-          sign: true, 
-          wallet: config.SEND_WALLET 
+          psbt: psbtBase64,
+          finalize: true,
+          sign: true,
+          wallet: config.SEND_WALLET
         });
 
         if (processedError || !processedResult) {
@@ -81,14 +96,14 @@ export async function processSendSession(sendSess: Send, config: Config) {
         }
 
         if (!processedResult.complete) {
-          logger.error(processSendSession, 'failed to complete psbt:', processedResult);
+          logger.error(processSendSession, 'payjoin proposal PSBT could not be fully signed', processedResult);
           return;
         }
 
-        const { error: finalizeError, result: finalizeResult } = await cnClient.finalizePsbt({ 
-          psbt: processedResult.psbt, 
-          extract: true, 
-          wallet: config.SEND_WALLET 
+        const { error: finalizeError, result: finalizeResult } = await cnClient.finalizePsbt({
+          psbt: processedResult.psbt,
+          extract: true,
+          wallet: config.SEND_WALLET
         });
 
         if (finalizeError || !finalizeResult) {
@@ -116,31 +131,31 @@ export async function processSendSession(sendSess: Send, config: Config) {
         if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
           logger.error(processSendSession, 'failed to decode final psbt:', decodedFinalPsbtError);
         } else {
-          // full fee for the transaction
           totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
           logger.debug(processSendSession, 'total fee:', totalFee);
 
-          // total amount of all our inputs
           senderTotalInputAmount = decodedFinalPsbtResult.inputs
-            .filter((input) => 
-              input.witness_utxo && 
-              input.witness_utxo.scriptPubKey.address && 
+            .filter((input) =>
+              input.witness_utxo &&
+              input.witness_utxo.scriptPubKey.address &&
               isAddressOwned(input.witness_utxo.scriptPubKey.address, config)
             )
             .reduce((acc, input) => acc + Utils.btcToSats(input.witness_utxo?.amount || 0), 0n);
           logger.debug(processSendSession, 'total sender input amount:', senderTotalInputAmount);
 
-          // get the amount of our output
           senderTotalOutputAmount = decodedFinalPsbtResult.tx.vout
-            .filter((output) => 
-              output.scriptPubKey.address && 
+            .filter((output) =>
+              output.scriptPubKey.address &&
               isAddressOwned(output.scriptPubKey.address, config)
             )
             .reduce((acc, output) => acc + Utils.btcToSats(output.value || 0), 0n);
           logger.debug(processSendSession, 'total sender output amount:', senderTotalOutputAmount);
 
-          // calculate the sender fee
-          senderFee = senderTotalInputAmount - senderTotalOutputAmount - sendSess.amount;
+          const rawFee = senderTotalInputAmount - senderTotalOutputAmount - sendSess.amount;
+          senderFee = rawFee >= 0n ? rawFee : 0n;
+          if (rawFee < 0n) {
+            logger.warn(processSendSession, 'sender fee calculation produced negative value — address ownership may be misclassified:', rawFee);
+          }
           logger.debug(processSendSession, 'sender fee:', senderFee);
         }
 
@@ -155,18 +170,18 @@ export async function processSendSession(sendSess: Send, config: Config) {
               senderOutAmount: senderTotalOutputAmount,
             }
           });
-  
+
           logger.info(processSendSession, 'updated session with txid:', sendResult);
           logger.info(processSendSession, 'updated session:', updateResult);
         } else {
-          logger.error(processSendSession, 'final response is empty or not a txid');
-          // @todo flag it as having an error here perhaps?
+          logger.error(processSendSession, 'broadcast succeeded but no txid returned');
         }
-      } else {
-        logger.error(processSendSession, 'final response is empty or not a psbt');
-        // @todo flag it as having an error here perhaps?
+
         return;
       }
+
+      logger.info(processSendSession, 'Session is in terminal state (Closed), skipping:', sessionState.tag);
+
     } catch (e) {
       logger.error(processSendSession, 'failed to restore session:', e);
     }

@@ -99,7 +99,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.Initialized) {
         logger.debug(processReceiveSession, 'Receiver is in Initialized state');
 
-        const rr = receiver.createPollRequest(config.OHTTP_RELAY);
+        const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
         const responseBuffer = await fetchBufferResponse(rr.request);
 
         logger.debug(processReceiveSession, 'fetched poll response. About to processResponse');
@@ -345,7 +345,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         // flush persisted state before sending the proposal so a crash after send can replay correctly
         await persister.flush();
 
-        const rr = receiver.createPostRequest(config.OHTTP_RELAY);
+        const rr = receiver.createPostRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
         const responseBuffer = await fetchBufferResponse(rr.request);
 
         // Note: a success response here doesn't mean the sender accepted the PSBT.

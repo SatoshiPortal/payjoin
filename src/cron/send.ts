@@ -5,7 +5,7 @@ import { Config } from "../config";
 import { Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { extractFeeFromPsbt, fetchBufferResponse } from "../lib/payjoin";
+import { extractFeeFromPsbt, fetchBufferResponse, withRelayFallback } from "../lib/payjoin";
 import { SenderPersister } from "../lib/persister";
 
 export async function restoreSendSessions(config: Config) {
@@ -53,9 +53,14 @@ export async function processSendSession(sendSess: Send, config: Config) {
         logger.debug(processSendSession, 'Sender is in WithReplyKey state — sending initial V2 post');
 
         const sender = sessionState.inner.inner;
-        const { request, ohttpCtx } = sender.createV2PostRequest(config.OHTTP_RELAY);
-        const responseBuffer = await fetchBufferResponse(request);
+        const { result: { responseBuffer, ohttpCtx }, relay } = await withRelayFallback(async (relay) => {
+          const { request, ohttpCtx } = sender.createV2PostRequest(relay);
+          const responseBuffer = await fetchBufferResponse(request);
+          return { responseBuffer, ohttpCtx };
+        });
         sender.processResponse(responseBuffer, ohttpCtx).save(persister);
+
+        await db.send.update({ where: { id: sendSess.id }, data: { ohttpRelay: relay } });
 
         logger.info(processSendSession, 'Initial V2 post complete — session advanced to PollingForProposal');
         return;
@@ -65,7 +70,7 @@ export async function processSendSession(sendSess: Send, config: Config) {
         logger.debug(processSendSession, 'Sender is in PollingForProposal state — polling for proposal');
 
         const sender = sessionState.inner.inner;
-        const { request, ohttpCtx } = sender.createPollRequest(config.OHTTP_RELAY);
+        const { request, ohttpCtx } = sender.createPollRequest(sendSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
         const responseBuffer = await fetchBufferResponse(request);
         const outcome = sender.processResponse(responseBuffer, ohttpCtx).save(persister);
 

@@ -15,6 +15,20 @@ import { decodeBech32NoChecksum, decodeU32LE } from "./bech32";
 import { ReceiverPersister, SenderPersister } from "./persister";
 import { db } from "./db";
 
+export async function withRelayFallback<T>(fn: (relay: string) => Promise<T>): Promise<{ result: T; relay: string }> {
+  let lastError: unknown;
+  for (const relay of config.OHTTP_RELAYS) {
+    try {
+      const result = await fn(relay);
+      return { result, relay };
+    } catch (e) {
+      logger.warn(withRelayFallback, `Relay ${relay} failed, trying next:`, e);
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+
 async function fetchOhttpKeys(
   ohttpRelay: string,
   payjoinDirectory: string
@@ -23,7 +37,7 @@ async function fetchOhttpKeys(
   const proxyAgent = new HttpsProxyAgent(ohttpRelay);
   const response: AxiosResponse = await axios.get(ohttpKeysUrl, {
     httpsAgent: proxyAgent,
-    timeout: 10000,
+    timeout: config.OHTTP_RELAY_TIMEOUT_MS,
     headers: {
       Accept: 'application/ohttp-keys'
     },
@@ -36,16 +50,19 @@ async function fetchOhttpKeys(
 }
 
 export async function getOhttpKeys() {
-  logger.debug(getOhttpKeys, 'Fetching OHTTP keys from relay:', config.OHTTP_RELAY, 'and directory:', config.PAYJOIN_DIRECTORY);
-  const ohttpKeys = await fetchOhttpKeys(config.OHTTP_RELAY, config.PAYJOIN_DIRECTORY);
-  logger.debug(getOhttpKeys, 'Fetched OHTTP keys successfully');
-  return payjoin.OhttpKeys.decode(ohttpKeys.buffer as ArrayBuffer);
+  logger.debug(getOhttpKeys, 'Fetching OHTTP keys from relays:', config.OHTTP_RELAYS, 'and directory:', config.PAYJOIN_DIRECTORY);
+  const { result: ohttpKeysBuffer, relay } = await withRelayFallback((relay) =>
+    fetchOhttpKeys(relay, config.PAYJOIN_DIRECTORY)
+  );
+  logger.debug(getOhttpKeys, 'Fetched OHTTP keys successfully via relay:', relay);
+  return { keys: payjoin.OhttpKeys.decode(ohttpKeysBuffer.buffer as ArrayBuffer), relay };
 }
 
 export async function fetchBufferResponse(request: { url: string, contentType: string, body: any }): Promise<ArrayBuffer> {
     const axiosResponse = await axios.post(request.url, request.body, {
         headers: { "Content-Type": request.contentType },
-        responseType: 'arraybuffer'
+        responseType: 'arraybuffer',
+        timeout: config.OHTTP_RELAY_TIMEOUT_MS,
     });
     return axiosResponse.data;
 }
@@ -56,10 +73,10 @@ export function arrayBufferToHex(buffer: ArrayBuffer): string {
     return hexCodes.join('');
 }
 
-export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string }> {
+export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string; ohttpRelay: string }> {
   logger.info(createReceiver, `Creating receiver for address: ${address} amount: ${amount}`);
 
-  const ohttpKeys = await getOhttpKeys();
+  const { keys: ohttpKeys, relay: ohttpRelay } = await getOhttpKeys();
 
   const persister = new ReceiverPersister({ id, db });
 
@@ -76,7 +93,7 @@ export async function createReceiver({ id, address, amount }: { id: number | str
 
   const bip21 = receiver.pjUri().asString();
 
-  return { bip21 };
+  return { bip21, ohttpRelay };
 }
 
 export function parseBip21(bip21: string): { pjUri: payjoin.PjUriInterface, amount: bigint, address: string, expiry: Date } {

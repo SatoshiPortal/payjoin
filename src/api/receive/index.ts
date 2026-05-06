@@ -47,12 +47,13 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
 
     let receive = await db.receive.create({ data });
 
-    const { bip21 } = await createReceiver({ id: receive.id, address: params.address, amount: BigInt(params.amount) });
+    const { bip21, ohttpRelay } = await createReceiver({ id: receive.id, address: params.address, amount: BigInt(params.amount) });
 
     receive = await db.receive.update({
       where: { id: receive.id },
       data: {
         bip21,
+        ohttpRelay,
       }
     });
 

@@ -14,7 +14,8 @@ export interface Config {
   RECEIVE_WALLET: string; // the wallet to use for receiving addresses to (e.g. "01", "02", etc)
   PAYJOIN_DIRECTORY: string; // the directory server where the payjoin data is stored
   PAYJOIN_RECEIVE_EXPIRY: bigint; // the number of seconds before a payjoin request expires
-  OHTTP_RELAY: string; // the URL of the ohttp relay ( https://pj.bobspacebkk.com, https://ohttp.cakewallet.com, https://pj.benalleng.com )
+  OHTTP_RELAYS: string[]; // ordered list of ohttp relay URLs to try in sequence
+  OHTTP_RELAY_TIMEOUT_MS: number; // per-relay timeout in milliseconds when attempting fallback
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
 }
 
@@ -30,7 +31,8 @@ export let config: Config = {
   RECEIVE_WALLET: process.env.RECEIVE_WALLET || "01",
   PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",
   PAYJOIN_RECEIVE_EXPIRY: BigInt(process.env.PAYJOIN_RECEIVE_EXPIRY  || 300), // 5 minutes - to be inline roughly with the order expiry
-  OHTTP_RELAY: process.env.OHTTP_RELAY || "https://ohttp.cakewallet.com",
+  OHTTP_RELAYS: process.env.OHTTP_RELAYS ? process.env.OHTTP_RELAYS.split(',').map(s => s.trim()) : ["https://ohttp.cakewallet.com", "https://pj.benalleng.com", "https://pj.bobspacebkk.com"],
+  OHTTP_RELAY_TIMEOUT_MS: Number(process.env.OHTTP_RELAY_TIMEOUT_MS || 10000),
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
 };
 
@@ -41,7 +43,10 @@ export function reloadConfig(): Config {
   for (const key in envConfig) {
     process.env[key] = envConfig[key];
     if (key in config) {
-      config[key] = castConfigValue(typeof config[key], envConfig[key]);
+      const currentValue = config[key];
+      config[key] = Array.isArray(currentValue)
+        ? envConfig[key].split(',').map((s: string) => s.trim())
+        : castConfigValue(typeof currentValue, envConfig[key]);
     }
   }
 

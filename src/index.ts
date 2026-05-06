@@ -4,6 +4,8 @@ import express, { Application } from 'express';
 import { startCron } from './cron';
 import logger from './lib/Log2File';
 import { uniffiInitAsync } from 'payjoin';
+import { setupGracefulShutdown } from './lib/gracefulShutdown';
+import { setGracefulShutdownRefs } from './lib/gracefulShutdownRefs';
 
 (async () => {
   logger.info('Starting....');
@@ -15,9 +17,12 @@ import { uniffiInitAsync } from 'payjoin';
 
   registerApi(app);
 
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     logger.info(`Server is running on http://localhost:${port}`);
   });
+
+  const { isShuttingDown, trackTask } = setupGracefulShutdown(server, logger);
+  setGracefulShutdownRefs(isShuttingDown, trackTask);
 
   startCron(config);
 })();

@@ -62,6 +62,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npx prisma generate
 RUN npm run build
 
+COPY scripts /payjoin/scripts
+RUN chmod +x /payjoin/scripts/entrypoint.sh
+
 EXPOSE 8000
 
-CMD ["npm", "run", "start"]
+CMD ["/payjoin/scripts/entrypoint.sh"]

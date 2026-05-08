@@ -30,7 +30,7 @@ services:
       # need this in here because sync-request ignores rejectUnauthorized=false
       - NODE_TLS_REJECT_UNAUTHORIZED=0
       - REPLICA_NUMBER={{.Task.Slot}}
-      - TOTAL_REPLICAS=1
+      - TOTAL_REPLICAS=2
     command: ["npm", "run", "start:dev"]
     volumes:
       - "$APP_SCRIPT_PATH/../:/payjoin"
@@ -73,7 +73,7 @@ services:
         - traefik.http.middlewares.payjoin-redirectregex.redirectregex.permanent=true
         - traefik.http.middlewares.payjoin-stripprefix.stripprefix.prefixes=/payjoin,/payjoin/
         - traefik.http.middlewares.payjoin-auth.basicauth.users=<username>:$$2y$$05$$LFKGjKBkmWbI5RUFBqwonOWEcen4Yu.mU139fvD3flWcP8gUqLLaC
-      replicas: 1
+      replicas: 2
       placement:
         constraints:
           - node.labels.io.cyphernode == true

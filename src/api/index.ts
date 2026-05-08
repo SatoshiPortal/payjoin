@@ -6,6 +6,7 @@ import { handleAddressCallback } from "./callback";
 import { registerConfigApi } from "./config";
 import { registerReceiveApi } from "./receive";
 import { registerSendApi } from "./send";
+import { isShuttingDown, trackTask } from "../lib/gracefulShutdownRefs";
 
 const server = new JSONRPCServer();
 
@@ -54,14 +55,26 @@ export function registerApi(app: Application): void {
 
   // address callback handler for watching addresses
   app.post('/send/address/*', async (req: Request, res: Response) => {
-    handleAddressCallback(req.body, "send").catch((e: any) => {
+    if (isShuttingDown()) {
+      res.sendStatus(503);
+      return;
+    }
+    trackTask(`send-address-callback-${Date.now()}`, () =>
+      handleAddressCallback(req.body, "send")
+    ).catch((e: any) => {
       logger.error('callback', 'Failed to handle address callback:', e);
     });
     res.sendStatus(200);
   });
 
   app.post('/receive/address/*', async (req: Request, res: Response) => {
-    handleAddressCallback(req.body, "receive").catch((e: any) => {
+    if (isShuttingDown()) {
+      res.sendStatus(503);
+      return;
+    }
+    trackTask(`receive-address-callback-${Date.now()}`, () =>
+      handleAddressCallback(req.body, "receive")
+    ).catch((e: any) => {
       logger.error('callback', 'Failed to handle address callback:', e);
     });
     res.sendStatus(200);

@@ -1,30 +1,13 @@
-import { BtcUri } from 'payjoin-ts';
+import { payjoin } from 'payjoin';
 import logger from './Log2File';
 import { cnClient } from "./globals";
 
-export async function isValidBip21(bip21: string): Promise<boolean> {
+export function isValidBip21(bip21: string): boolean {
   logger.info(isValidBip21, bip21);
 
-  const isValid = /^bitcoin:([13][a-km-zA-HJ-NP-Z1-9]{25,34})(\?.+)?$/.test(bip21);
-  if (!isValid) {
-    return false;
-  }
-
   try {
-    const uri = BtcUri.tryFrom(bip21);
-    if (!uri) {
-      return false;
-    }
-
-    const checkedUri = uri.assumeChecked();
-    if (!checkedUri) {
-      return false;
-    }
-
-    // @todo payjoin-typescript types need updating. This should be async
-    if (!(await checkedUri.checkPjSupported())) {
-      return false;
-    }
+    const uri = payjoin.Uri.parse(bip21);
+    uri.checkPjSupported();
   } catch (e) {
     logger.error(isValidBip21, 'Failed to parse bip21:', e);
     return false;

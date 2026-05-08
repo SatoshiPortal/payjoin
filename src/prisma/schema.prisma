@@ -28,6 +28,7 @@ model Send {
   expiryTs          DateTime?     @map("expiry_ts")
   cancelledTs       DateTime?     @map("cancelled_ts")
   session           String?
+  ohttpRelay        String?       @map("ohttp_relay")
   confirmedTs       DateTime?     @map("confirmed_ts")
   createdTs         DateTime      @default(now()) @map("created_ts")
   updatedTs         DateTime      @updatedAt @map("updated_ts")
@@ -41,7 +42,7 @@ model Send {
 
 model Receive {
   id                  Int           @id @default(autoincrement())
-  bip21               String        @unique
+  bip21               String?       @unique
   address             String        @unique
   amount              BigInt
   receiverInAmount    BigInt?       @map("receiver_input_amount")
@@ -55,6 +56,7 @@ model Receive {
   expiryTs            DateTime?     @map("expiry_ts")
   cancelledTs         DateTime?     @map("cancelled_ts")
   session             String?
+  ohttpRelay          String?       @map("ohttp_relay")
   firstSeenTs         DateTime?     @map("first_seen_ts")
   fallbackTs          DateTime?     @map("fallback_broadcast_ts")
   nonPayjoinTs        DateTime?     @map("non_payjoin_ts")

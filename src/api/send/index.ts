@@ -3,7 +3,7 @@ import { addJsonRpcMethod } from "..";
 import logger from "../../lib/Log2File";
 import { isValidBip21 } from "../../lib/validate";
 import { IReqSend, IRespSend } from "../../types/api/send";
-import { appendSendStatus, createSender } from "../../lib/payjoin";
+import { appendSendStatus, createSender, parseBip21 } from "../../lib/payjoin";
 import { config } from "../../config";
 import { db } from "../../lib/db";
 import { addressCallbackUrl } from "../callback";
@@ -23,13 +23,11 @@ export async function send(params: IReqSend): Promise<IRespSend> {
   }
 
   try {
-    const { sender, amount, address, expiry, psbt } = await createSender(params.bip21);
+    const { pjUri, amount, address, expiry } = parseBip21(params.bip21);
 
-    logger.debug('sender:', sender);
     logger.debug('amount:', amount);
     logger.debug('address:', address);
     logger.debug('expiry:', expiry);
-    logger.debug('psbt:', psbt);
 
     // Check if the expiry has already passed
     if (expiry && expiry < new Date()) {
@@ -40,19 +38,18 @@ export async function send(params: IReqSend): Promise<IRespSend> {
       );
     }
 
-    const sessionJson = sender.toJson();
-    logger.debug('sessionJson:', sessionJson);
-
     const data = {
       bip21: params.bip21,
       amount,
       address,
       callbackUrl: params.callbackUrl,
       expiryTs: expiry,
-      session: sessionJson
     }
 
-    const sendRecord = await db.send.create({ data });
+    let sendRecord = await db.send.create({ data });
+
+    const { psbt } = await createSender({ id: sendRecord.id, pjUri, amount, address });
+    logger.debug('psbt:', psbt);
 
     // watch the address for non-payjoin transactions
     const watchUrl = addressCallbackUrl('send', address);
@@ -120,6 +117,7 @@ async function cancelSend(params: { id: number }): Promise<{ id: number }> {
 
         return { id };
       } catch (e) {
+        if (e instanceof JSONRPCErrorException) throw e;
         logger.error(cancelSend, 'Failed to cancel send:', e);
         throw new JSONRPCErrorException('Failed to cancel send', JSONRPCErrorCode.InternalError);
       }

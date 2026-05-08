@@ -4,11 +4,14 @@ import { restoreSendSessions } from "./send";
 import { restoreReceiveSessions } from "./receive";
 import { lock } from "../lib/globals";
 import Utils from '../lib/Utils';
+import { isShuttingDown, trackTask } from '../lib/gracefulShutdownRefs';
 
 const lockName = "sessions";
 let activeInterval: NodeJS.Timeout | null = null;
 
 export function startCron(config: Config) {
+  if (isShuttingDown()) return;
+
   if (activeInterval) {
     logger.info(startCron, "Stopping previous interval");
     clearInterval(activeInterval);
@@ -20,25 +23,34 @@ export function startCron(config: Config) {
   const replicaLockName = `${lockName}-${replicaId}`;
 
   const runJob = async (config: Config) => {
+    if (isShuttingDown()) return;
+
     if (await lock.isBusy(replicaLockName)) {
-      logger.info(runJob, "Previous interval is still running");
+      logger.info(runJob, `Previous interval is still running: ${replicaLockName}. Skipping this run.`);
       return;
     }
 
-    lock.acquire(replicaLockName, async () => {
-      logger.info(runJob, "Lock acquired. Restoring sessions...");
-
+    await trackTask(`cron-sessions-${replicaId}`, async () => {
       try {
-        await restoreSendSessions(config);
-        await restoreReceiveSessions(config);
+        await lock.acquire(replicaLockName, async () => {
+          logger.info(runJob, "Lock acquired. Restoring sessions...");
+          await restoreSendSessions(config);
+          await restoreReceiveSessions(config);
+          logger.info(runJob, "Sessions processed. Releasing lock");
+        });
       } catch (e) {
-        logger.error(runJob, "Failed to restore sessions:", e);
+        logger.error(runJob, "Failed to run job:", e);
       }
-
-      logger.info(runJob, "Sessions processed. Releasing lock");
     });
   };
 
   activeInterval = setInterval(() => runJob(config), interval * 1000);
   logger.info(startCron, `Started interval every ${interval} seconds`);
+}
+
+export function stopCron() {
+  if (activeInterval) {
+    clearInterval(activeInterval);
+    activeInterval = null;
+  }
 }

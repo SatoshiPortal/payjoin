@@ -5,6 +5,11 @@
     "target": "ES2022",
     "noImplicitAny": false,
     "moduleResolution": "node",
+    "baseUrl": ".",
+    "ignoreDeprecations": "5.0",
+    "paths": {
+      "payjoin": ["./node_modules/payjoin/dist/nodejs/index"]
+    },
     "sourceMap": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,

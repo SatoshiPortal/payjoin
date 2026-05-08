@@ -1,18 +1,27 @@
-import { InputPairRequest, PayjoinReceiver } from "payjoin-ts";
+import { payjoin } from "payjoin";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
 import { Config } from "../config";
 import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { extractFeeFromPsbt } from "../lib/payjoin";
+import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse } from "../lib/payjoin";
+import { addressCallbackUrl } from "../api/callback/address";
+import { ReceiverPersister } from "../lib/persister";
 
 // used to cache and store known (or "seen") inputs
 // which are used to determine someone is attempting a probing attack
 let knownInputsCache: Map<string, string> = new Map();
-let newInputs: Set<string> = new Set();
 let lastCacheUpdateTime = 0;
 const CACHE_TTL = 60000; // 1 minute in milliseconds
+
+  interface InputPairWithMetadata {
+    inputPair: payjoin.InputPair;
+    txid: string;
+    vout: number;
+    amount: number | string;
+    scriptPubKey: string;
+  }
 
 export async function restoreReceiveSessions(config: Config) {
   logger.info(restoreReceiveSessions, 'restoring receive sessions');
@@ -22,6 +31,8 @@ export async function restoreReceiveSessions(config: Config) {
   // attempt to process all "current" receive sessions
   const allSessions = await db.receive.findMany({
     where: {
+      bip21: { not: null },
+      txid: null,
       confirmedTs: null,
       cancelledTs: null,
       expiryTs: {
@@ -35,9 +46,9 @@ export async function restoreReceiveSessions(config: Config) {
   });
   logger.info(restoreReceiveSessions, `found ${sessions.length} sessions to restore`);
 
-  for (const receiveSess of sessions) {
-    await processReceiveSession(receiveSess, config);
-  }
+  await Promise.all(
+    sessions.map(receiveSess => processReceiveSession(receiveSess, config))
+  );
 
   // attempt to broadcast any fallback txs that payjoin failed but fallback has not been broadcast
   const allFailedSessions = await db.receive.findMany({
@@ -55,9 +66,9 @@ export async function restoreReceiveSessions(config: Config) {
     return session.id % totalReplicas === (replicaId - 1);
   });
   logger.info(restoreReceiveSessions, `found ${failedSessions.length} failed sessions to broadcast`);
-  for (const receiveSess of failedSessions) {
-    await broadcastFallback(receiveSess, config);
-  }
+  await Promise.all(
+    failedSessions.map(receiveSess => broadcastFallback(receiveSess, config))
+  );
 }
 
 async function processReceiveSession(receiveSess: Receive, config: Config) {
@@ -72,34 +83,39 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
     }
 
     // populate the known inputs cache
-    getKnownInputsSet().catch(logger.error);
+    await getKnownInputsSet().catch(logger.error);
 
     try {
-      const restoredReceiver = PayjoinReceiver.fromJson(receiveSess.session!);
-      const request = restoredReceiver.extractRequest();
-      const response = await request.post();
+      const persister = new ReceiverPersister({ id: receiveSess.id, db });
+      persister.restore(JSON.parse(receiveSess.session || '[]'));
+      const replayResult = payjoin.replayReceiverEventLog(persister);
 
-      const uncheckedProposal = await restoredReceiver.processResponse(response, request);
-      if (!uncheckedProposal) {
-        logger.info(processReceiveSession, 'no proposal found yet');
-        return;
+      const restoredReceiver = replayResult.state();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let receiver: any = restoredReceiver.inner.inner;
+
+      logger.debug(processReceiveSession, 'restored receiver state:', restoredReceiver.tag);
+
+      if (receiver instanceof payjoin.Initialized) {
+        logger.debug(processReceiveSession, 'Receiver is in Initialized state');
+
+        const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        const responseBuffer = await fetchBufferResponse(rr.request);
+
+        logger.debug(processReceiveSession, 'fetched poll response. About to processResponse');
+        const result = receiver.processResponse(responseBuffer, rr.clientResponse).save(persister);
+        logger.debug(processReceiveSession, 'processed poll response');
+        if (!result || result instanceof payjoin.InitializedTransitionOutcome.Stasis) {
+          logger.info(processReceiveSession, 'no proposal found yet');
+          return;
+        } else if (result instanceof payjoin.InitializedTransitionOutcome.Progress) {
+          logger.debug(processReceiveSession, 'Receiver is in Progress state');
+          receiver = result.inner.inner;
+        } else {
+          logger.error(processReceiveSession, 'Unexpected Initialized Transition Outcome', result);
+          return;
+        }
       }
-
-      const fallbackTxHex = uncheckedProposal.originalTx();
-      logger.info(processReceiveSession, 'fallback tx hex:', fallbackTxHex);
-
-      if (!fallbackTxHex) {
-        logger.info(processReceiveSession, 'no fallback tx hex found');
-        return;
-      }
-
-      const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: fallbackTxHex }); 
-
-      if (decodeError || !decodeResult) {
-        logger.error(processReceiveSession, 'failed to decode fallback tx:', decodeError);
-        return;
-      }
-      logger.info(processReceiveSession, 'decoded fallback tx:', decodeResult);
 
       const { error: minFeeError, result: minFeeResult } = await cnClient.getFeeRate({
         confTarget: 6,
@@ -110,243 +126,320 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       }
       logger.info(processReceiveSession, 'min fee rate:', minFeeResult?.feerate);
 
-      const maybeInputsOwned = await uncheckedProposal.checkBroadcastSuitability(
-        Number(minFeeResult!.feerate),
-        canBroadcast
-      );
+      if (receiver instanceof payjoin.UncheckedOriginalPayload) {
+        logger.debug(processReceiveSession, 'Receiver is in UncheckedOriginalPayload state');
 
-      // transaction is suitable for broadcast so let's store it for fallback later if we need to
-      receiveSess = await db.receive.update({
-        where: { id: receiveSess.id },
-        data: {
-          fallbackTxHex,
-        }
-      });
+        receiver = receiver.checkBroadcastSuitability(
+            BigInt(minFeeResult!.feerate),
+            { callback: canBroadcast },
+        ).save(persister);
+      }
 
-      const maybeInputsSeen = await maybeInputsOwned.checkInputsNotOwned(
-        (script: string) => isOwned(script, config)
-      );
-      logger.debug('checkInputsNotOwned complete');
+      if (receiver instanceof payjoin.MaybeInputsOwned) {
+        logger.debug(processReceiveSession, 'Receiver is in MaybeInputsOwned state');
 
-      const outputsUnknown = await maybeInputsSeen.checkNoInputsSeenBefore(
-        (outpoint: string) => isKnown(outpoint, receiveSess.bip21),
-      );
+        receiver = receiver.checkInputsNotOwned(
+          { callback: (script: ArrayBuffer) => isOwned(script, config) },
+        ).save(persister);
 
-      // save any new "seen" inputs to the database and add to cache
-      await saveKnownInputs(receiveSess.bip21);
-
-      logger.debug('checkNoInputsSeenBefore complete');
+        logger.debug('checkInputsNotOwned complete');
+      }
       
-      const receiverOutputs = decodeResult.tx.vout
-        .filter(vout => vout.scriptPubKey.address === receiveSess.address)
-        .map((vout) => {
-          return [
-            vout.n,
-            vout.scriptPubKey.hex,
-          ] as [number, string];
-        }
-      );
+      if (receiver instanceof payjoin.MaybeInputsSeen) {
+        logger.debug(processReceiveSession, 'Receiver is in MaybeInputsSeen state');
 
-      const isReceiverOutput = (script: string): boolean => {
-        return receiverOutputs.some((output) => output[1].toString() === script);
+        const sessionNewInputs = new Set<string>();
+        receiver = receiver.checkNoInputsSeenBefore(
+          { callback: (outpoint: payjoin.PlainOutPoint) => isKnown(outpoint, receiveSess.bip21!, sessionNewInputs) }
+        ).save(persister);
+
+        // save any new "seen" inputs to the database and add to cache
+        await saveKnownInputs(receiveSess.bip21!, sessionNewInputs);
+
+        logger.debug('checkNoInputsSeenBefore complete');
       }
-      const wantsOutputs = await outputsUnknown.identifyReceiverOutputs(isReceiverOutput);
-      logger.debug('identifyReceiverOutputs complete');
 
-      // if (!wantsOutputs.isOutputSubstitutionDisabled()) {
-      //   // @todo substitute the outputs - do we need to do that in any cases?
-      //   logger.debug(restoreReceiveSessions, 'output substitution allowed');
-      // }
-      const wantsInputs = wantsOutputs.commitOutputs();
-      logger.debug('commitOutputs complete');
+      if (!receiveSess.fallbackTxHex) {
+        logger.debug(processReceiveSession, 'no fallback tx hex found, attempting to get from session history');
+        const finalReplayResult = payjoin.replayReceiverEventLog(persister);
+        const sessionHistory = finalReplayResult.sessionHistory();
+        const fallbackTx = sessionHistory.fallbackTx();
+        logger.debug(processReceiveSession, 'got fallback tx from session history:', fallbackTx);
 
-      const availableInputs = async () => {
-        const { error: utxosError, result: utxosResult } = await cnClient.listUnspent({ wallet: config.RECEIVE_WALLET });
-        if (utxosError || !utxosResult) {
-          logger.error(processReceiveSession, 'failed to list unspent:', utxosError);
-          return [];
+        if (fallbackTx) {
+          logger.debug(processReceiveSession, 'got fallback tx from session history:', fallbackTx);
+          const fallbackTxHex = arrayBufferToHex(fallbackTx);
+
+          const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: fallbackTxHex }); 
+
+          if (decodeError || !decodeResult) {
+            logger.error(processReceiveSession, 'failed to decode fallback tx:', decodeError);
+            return;
+          }
+          logger.info(processReceiveSession, 'decoded fallback tx:', decodeResult);
+
+          receiveSess = await db.receive.update({
+            where: { id: receiveSess.id },
+            data: {
+              fallbackTxHex,
+            }
+          });
+        } else {
+          logger.warn(processReceiveSession, 'no fallback tx found in session history');
         }
+      }
 
-        // sort smallest to largest
-        const sortedUtxos = [...utxosResult.utxos]
-          .filter((utxo) => utxo.confirmations > 0)
-          .sort((a, b) => {
-            return Number(Utils.btcToSats(a.amount) - Utils.btcToSats(b.amount))
+      if (!receiveSess.fallbackTxHex) {
+        logger.info(processReceiveSession, 'no fallback tx hex found');
+        return;
+      }
+
+      if (receiver instanceof payjoin.OutputsUnknown) {
+        logger.debug(processReceiveSession, 'Receiver is in OutputsUnknown state');
+
+        const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: receiveSess.fallbackTxHex }); 
+
+        if (decodeError || !decodeResult) {
+          logger.error(processReceiveSession, 'failed to decode fallback tx:', decodeError);
+          return;
+        }
+        logger.info(processReceiveSession, 'decoded fallback tx:', decodeResult);
+
+        const receiverOutputs = decodeResult.tx.vout
+          .filter(vout => vout.scriptPubKey.address === receiveSess.address)
+          .map((vout) => {
+            return [
+              vout.n,
+              vout.scriptPubKey.hex,
+            ] as [number, string];
           });
 
-        const inputs: any[] = [];
-        for (const utxo of sortedUtxos) {
-          const { error: txError, result: txResult } = await cnClient.getTransaction(utxo.txid);
-          if (txError || !txResult) {
-            logger.error(processReceiveSession, 'failed to get transaction:', txError);
-            continue;
-          }
-
-          const psbtInput = {
-            witnessUtxo: {
-              amount: utxo.amount,
-              scriptPubKey: utxo.scriptPubKey
-            },
-          }
-          const txIn = { txid: utxo.txid, vout: utxo.vout };
-
-          inputs.push({
-            prevout: txIn,
-            psbtData: psbtInput
-          });
-
-          // limit to 10 inputs to provide to payjoin library
-          if (inputs.length >= 20) {
-            break;
-          }
+        const isReceiverOutput = (script: ArrayBuffer): boolean => {
+          const scriptHex = arrayBufferToHex(script);
+          return receiverOutputs.some((output) => output[1].toString() === scriptHex);
         }
 
-        return inputs;
-      };
+        receiver = receiver.identifyReceiverOutputs(
+          { callback: isReceiverOutput }
+        )
+        .save(persister);
 
-      // get apropriate inputs to contribute
-      const inputs: Array<InputPairRequest> = await availableInputs();
+        logger.debug('identifyReceiverOutputs complete');
+      }
+      
+      // tracks the address actually used in the payjoin output (may differ from receiveSess.address after substitution)
+      let effectiveReceiverAddress = receiveSess.address;
+
+      if (receiver instanceof payjoin.WantsOutputs) {
+        logger.debug(processReceiveSession, 'Receiver is in WantsOutputs state');
+
+        if (config.OUTPUT_SUBSTITUTION_ENABLED && receiver.outputSubstitution() === payjoin.OutputSubstitution.Enabled) {
+          const { error: addrError, result: addrResult } = await cnClient.getnewaddress({ wallet: config.RECEIVE_WALLET });
+          if (!addrError && addrResult?.address) {
+            try {
+              const { error: addrInfoError, result: addrInfoResult } = await cnClient.getAddressInfo({ address: addrResult.address, wallet: config.RECEIVE_WALLET });
+              if (addrInfoError || !addrInfoResult?.scriptPubKey) {
+                throw new Error(`Failed to get scriptPubKey for address: ${addrResult.address}`);
+              }
+              const freshScript = new Uint8Array(Buffer.from(addrInfoResult.scriptPubKey, 'hex')).buffer;
+              receiver = receiver.substituteReceiverScript(freshScript).commitOutputs().save(persister);
+              effectiveReceiverAddress = addrResult.address;
+              logger.info(processReceiveSession, 'substituted receiver output to fresh address:', addrResult.address);
+
+              // swap the watch from the original BIP21 address to the substituted address
+              // so that the address callback fires correctly when the payjoin tx confirms
+              const oldWatchUrl = addressCallbackUrl('receive', receiveSess.address!);
+              await cnClient.unwatch({ address: receiveSess.address!, unconfirmedCallbackURL: oldWatchUrl, confirmedCallbackURL: oldWatchUrl });
+              const newWatchUrl = addressCallbackUrl('receive', effectiveReceiverAddress);
+              await cnClient.watch({ address: effectiveReceiverAddress, unconfirmedCallbackURL: newWatchUrl, confirmedCallbackURL: newWatchUrl });
+              receiveSess = await db.receive.update({ where: { id: receiveSess.id }, data: { address: effectiveReceiverAddress } });
+            } catch (subErr) {
+              logger.warn(processReceiveSession, 'output substitution failed, committing without substitution:', subErr);
+              receiver = receiver.commitOutputs().save(persister);
+            }
+          } else {
+            logger.warn(processReceiveSession, 'could not get fresh address for substitution:', addrError);
+            receiver = receiver.commitOutputs().save(persister);
+          }
+        } else {
+          receiver = receiver.commitOutputs().save(persister);
+        }
+
+        logger.debug('commitOutputs complete');
+      }
+
+      // get appropriate inputs to contribute - these are outside the WantsInputs block as we use them later also
+      const inputs = await availableInputs(config);
       logger.debug(processReceiveSession, 'selected inputs:', inputs);
-      if (inputs.length === 0) {
-        logger.error(processReceiveSession, 'no inputs found to contribute');
-        return;
-      }
-      const provisionalProposal = await wantsInputs.tryContributeInputs(inputs);
-      logger.debug('tryContributeInputs complete');
 
-      const { error: maxFeeError, result: maxFeeResult } = await cnClient.getFeeRate({
-        confTarget: 1,
-      });
-      if (maxFeeError) {
-        logger.error(processReceiveSession, 'failed to get fee rate:', maxFeeError);
-        return;
-      }
-      logger.info(processReceiveSession, 'max fee rate:', maxFeeResult?.feerate);
+      if (receiver instanceof payjoin.WantsInputs) {
+        logger.debug(processReceiveSession, 'Receiver is in WantsInputs state');
 
-      const payjoinProposal = await provisionalProposal.finalizeProposal(
-        Number(minFeeResult!.feerate),
-        Number(maxFeeResult!.feerate),
-        (psbt: string) => walletProcessPsbt(psbt, config),
-      );
-
-      logger.debug(processReceiveSession, 'finalized proposal:', payjoinProposal);
-
-      const psbt = payjoinProposal.psbt();
-      logger.info(processReceiveSession, 'finalized proposal psbt:', psbt);
-
-      // lock utxos using utxosToBeLocked
-      const toLock = await payjoinProposal.utxosToBeLocked();
-      logger.debug(processReceiveSession, 'utxos to be locked:', toLock);
-
-      // lock the inputs used in the payjoin tx
-      // Note: we might have to be careful with these locks. If the payjoin fails below this point
-      // we may end up with "orphand" locks.
-      if (toLock && toLock.length > 0) {
-        const lockUtxos = toLock.map((utxo) => {
-          const [ txid, vout ] = utxo.split(':');
-          return {
-            txid,
-            vout: Number(vout),
-          }
-        });
-
-        // loop over them and lock individually in case any of them fail
-        for (const utxo of lockUtxos) {
-          await cnClient.lockUnspent({ utxos: [utxo], wallet: config.RECEIVE_WALLET });
+        if (inputs.length === 0) {
+          logger.error(processReceiveSession, 'no inputs found to contribute');
+          return;
         }
+
+        const inputPairs = inputs.map((input) => input.inputPair);
+        const selectedInput = receiver.tryPreservingPrivacy(inputPairs);
+        logger.debug("SELECTED INPUT:", selectedInput, JSON.stringify(selectedInput));
+        receiver = receiver.contributeInputs([selectedInput])
+          .commitInputs()
+          .save(persister);
+
+        logger.debug('tryContributeInputs complete');
       }
+      
+      if (receiver instanceof payjoin.WantsFeeRange) {
+        logger.debug(processReceiveSession, 'Receiver is in WantsFeeRange state');
 
-      const proposalRequest = await payjoinProposal.extractV2Req();
-      const proposalResponse = await proposalRequest.post();
-
-      // Note: we seem to be getting a success response here even if the sender doesn't like the 
-      // PSBT we sent. We will likely need some rules in place to handle broadcasting the fallback tx
-      // after a certain amount of time if the payjoin tx is not broadcasted.
-      const updatedPayjoin = await payjoinProposal.processRes(proposalResponse, proposalRequest);
-
-      const finalPsbt = updatedPayjoin.psbt();
-
-      let totalFee = 0n, receiverFee = 0n, receiverTotalInputAmount = 0n, receiverTotalOutputAmount = 0n;
-      const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
-      if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
-        logger.error(processReceiveSession, 'failed to decode final psbt:', decodedFinalPsbtError);
-      } else {
-        // full fee for the transaction
-        totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
-        logger.debug(processReceiveSession, 'total fee:', totalFee);
-
-        // total the amount of all of our inputs
-        receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
-          return (
-            input.witness_utxo &&
-            input.witness_utxo.amount &&
-            // this is one our candidate inputs we provided above - i.e. we own it
-            inputs.some((possibleInput) => possibleInput.psbtData.witnessUtxo?.scriptPubKey === input.witness_utxo?.scriptPubKey.hex));
-        }).reduce((acc, input) => {
-          return acc + Utils.btcToSats(input.witness_utxo?.amount || 0);
-        }, 0n);
-        logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
-
-        // get the amount of our output
-        receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
-          if (output.scriptPubKey.address === receiveSess.address) {
-            return acc + Utils.btcToSats(output.value);
-          }
-          return acc;
-        }, 0n);
-        logger.debug(processReceiveSession, 'total receiver output amount:', receiverTotalOutputAmount);
-
-        // calculate the receiver fee
-        const receiverFee = receiverTotalInputAmount - receiverTotalOutputAmount + receiveSess.amount;
-        logger.debug(processReceiveSession, 'receiver fee:', receiverFee);
-      }
-
-      // double chexk that the sent amount matches the amount we expect
-      const calculatedAmount = receiverTotalOutputAmount - receiverTotalInputAmount - receiverFee;
-      let updateAmount = receiveSess.amount;
-      const tolerance = 10n;
-      const difference = calculatedAmount > receiveSess.amount 
-        ? calculatedAmount - receiveSess.amount 
-        : receiveSess.amount - calculatedAmount;
-
-      if (difference > tolerance) {
-        logger.error(
-          processReceiveSession, 
-          `calculated amount differs from expected by ${difference} sats (more than ${tolerance} tolerance): ` +
-          `calculated=${calculatedAmount}, expected=${receiveSess.amount}`
-        );
-        // set to update the payjoin amount
-        updateAmount = calculatedAmount;
-      } else if (difference > 0n) {
-        // Amounts differ but within tolerance
-        logger.info(
-          processReceiveSession, 
-          `calculated amount differs from expected by ${difference} sats (within ${tolerance} tolerance): ` +
-          `calculated=${calculatedAmount}, expected=${receiveSess.amount}`
-        );
-      }
-
-      const txid = updatedPayjoin.getTxid();
-      logger.debug(processReceiveSession, 'updated proposal txid:', txid);
-      if (txid) {
-        const updateResult = await db.receive.update({
-          where: { id: receiveSess.id },
-          data: {
-            txid,
-            amount: updateAmount,
-            fee: totalFee,
-            receiverFee,
-            receiverInAmount: receiverTotalInputAmount,
-            receiverOutAmount: receiverTotalOutputAmount,
-          }
+        const { error: maxFeeError, result: maxFeeResult } = await cnClient.getFeeRate({
+          confTarget: 1,
         });
-        logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);
+        if (maxFeeError) {
+          logger.error(processReceiveSession, 'failed to get fee rate:', maxFeeError);
+          return;
+        }
+        logger.info(processReceiveSession, 'max fee rate:', maxFeeResult?.feerate);
+
+        receiver = receiver.applyFeeRange(BigInt(minFeeResult!.feerate), BigInt(maxFeeResult!.feerate)).save(persister);
+      }
+      
+      if (receiver instanceof payjoin.ProvisionalProposal) {
+        logger.debug(processReceiveSession, 'Receiver is in ProvisionalProposal state');
+
+        receiver = receiver.finalizeProposal(
+          { callback: (psbt: string) => walletProcessPsbt(psbt, config) }
+        )
+        .save(persister);
+      }
+      
+      if (receiver instanceof payjoin.PayjoinProposal) {
+        logger.debug(processReceiveSession, 'Receiver is in PayjoinProposal state');
+
+        const finalPsbt = receiver.psbt();
+        logger.info(processReceiveSession, 'finalized proposal psbt:', finalPsbt);
+
+        // lock utxos using utxosToBeLocked
+        const toLock = receiver.utxosToBeLocked();
+        logger.debug(processReceiveSession, 'utxos to be locked:', toLock);
+
+        // lock the inputs used in the payjoin tx
+        // Note: we might have to be careful with these locks. If the payjoin fails below this point
+        // we may end up with "orphand" locks.
+        if (toLock && toLock.length > 0) {
+          const lockUtxos = toLock.map((utxo) => {
+            const { txid, vout } = utxo;
+            return {
+              txid,
+              vout: Number(vout),
+            }
+          });
+
+          // loop over them and lock individually in case any of them fail
+          for (const utxo of lockUtxos) {
+            await cnClient.lockUnspent({ utxos: [utxo], wallet: config.RECEIVE_WALLET });
+          }
+        }
+
+        // flush persisted state before sending the proposal so a crash after send can replay correctly
+        await persister.flush();
+
+        const rr = receiver.createPostRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        const responseBuffer = await fetchBufferResponse(rr.request);
+
+        // Note: a success response here doesn't mean the sender accepted the PSBT.
+        // Fallback tx broadcast is handled separately after a timeout if the payjoin tx is not seen.
+        const result = receiver.processResponse(responseBuffer, rr.clientResponse).save(persister);
+        logger.debug(processReceiveSession, 'processed proposal response:', result);
+        
+        const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
+        if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
+          logger.error(processReceiveSession, 'failed to decode final psbt:', decodedFinalPsbtError);
+        } else {
+          let totalFee = 0n, receiverFee = 0n, receiverTotalInputAmount = 0n, receiverTotalOutputAmount = 0n;
+
+          // full fee for the transaction
+          totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
+          logger.debug(processReceiveSession, 'total fee:', totalFee);
+
+          // total the amount of all of our inputs
+          receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
+            return (
+              input.witness_utxo &&
+              input.witness_utxo.amount &&
+              // this is one our candidate inputs we provided above - i.e. we own it
+              inputs.some((possibleInput: InputPairWithMetadata) => {
+                logger.debug(processReceiveSession, 'comparing possible input:', possibleInput.scriptPubKey, possibleInput.amount, 'with input:', input.witness_utxo?.scriptPubKey, input.witness_utxo?.amount);
+                return possibleInput.scriptPubKey === input.witness_utxo?.scriptPubKey.hex;
+              })
+            );
+          }).reduce((acc, input) => {
+            return acc + Utils.btcToSats(input.witness_utxo?.amount || 0);
+          }, 0n);
+          logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
+
+          // get the amount of our output (use effectiveReceiverAddress to handle output substitution)
+          receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
+            if (output.scriptPubKey.address === effectiveReceiverAddress) {
+              return acc + Utils.btcToSats(output.value);
+            }
+            return acc;
+          }, 0n);
+          logger.debug(processReceiveSession, 'total receiver output amount:', receiverTotalOutputAmount);
+
+          // net amount received = outputs - contributed inputs
+          // receiverFee = expected payment - net received (positive means receiver paid fees)
+          const netReceived = receiverTotalOutputAmount - receiverTotalInputAmount;
+          receiverFee = receiveSess.amount - netReceived;
+          logger.debug(processReceiveSession, 'receiver fee:', receiverFee, 'net received:', netReceived);
+
+          // verify net received is close to the expected payment amount
+          const calculatedAmount = netReceived;
+          let updateAmount = receiveSess.amount;
+          const tolerance = 10n;
+          const difference = calculatedAmount > receiveSess.amount
+            ? calculatedAmount - receiveSess.amount
+            : receiveSess.amount - calculatedAmount;
+
+          if (difference > tolerance) {
+            logger.error(
+              processReceiveSession,
+              `net received differs from expected by ${difference} sats (more than ${tolerance} tolerance): ` +
+              `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
+            );
+            updateAmount = calculatedAmount;
+          } else if (difference > 0n) {
+            logger.info(
+              processReceiveSession,
+              `net received differs from expected by ${difference} sats (within ${tolerance} tolerance): ` +
+              `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
+            );
+          }
+
+          const txid = decodedFinalPsbtResult.tx.txid;
+          logger.debug(processReceiveSession, 'updated proposal txid:', txid);
+          if (txid) {
+            const updateResult = await db.receive.update({
+              where: { id: receiveSess.id },
+              data: {
+                txid,
+                amount: updateAmount,
+                fee: totalFee,
+                receiverFee,
+                receiverInAmount: receiverTotalInputAmount,
+                receiverOutAmount: receiverTotalOutputAmount,
+              }
+            });
+            logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);
+          }
+        }
       }
 
     } catch (e) {
       logger.error(processReceiveSession, 'failed to restore session:', e);
 
-      await db.receive.update({
+      await db.receive.updateMany({
         where: { id: receiveSess.id, failedTs: null },
         data: {
           failedTs: new Date(),
@@ -358,12 +451,14 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
   });
 }
 
-function canBroadcast(tx: string): boolean {
+function canBroadcast(tx: ArrayBuffer): boolean {
   logger.debug(canBroadcast, 'checking if tx can be broadcast:', tx);
   
+  const txHex = arrayBufferToHex(tx);
+
   // ensure that the fallback tx can be broadcast
   const { error: acceptError, result: acceptResult } = syncCnClient.syncTestMempoolAccept({
-    rawtx: tx,
+    rawtx: txHex,
   });
   
   if (acceptError || !acceptResult) {
@@ -373,15 +468,18 @@ function canBroadcast(tx: string): boolean {
     logger.info(canBroadcast, 'tx not suitable for broadcast:', acceptResult);
     return false;
   } else {
+    logger.info(canBroadcast, 'tx suitable for broadcast:', acceptResult);
     return true;
   }
 };
 
-function isOwned(script: string, config: Config): boolean {
+function isOwned(script: ArrayBuffer, config: Config): boolean {
   logger.debug(isOwned, 'checking if script is owned:', script);
 
+  const scriptHex = arrayBufferToHex(script);
+
   const { error: decodeError, result: decodeResult } = syncCnClient.syncDecodeScript(
-    script,
+    scriptHex,
   );
 
   if (decodeError || !decodeResult) {
@@ -411,26 +509,28 @@ function isOwned(script: string, config: Config): boolean {
   return false;
 }
 
-function isKnown(outpoint: string, currentBip21): boolean {
+function isKnown(outpoint: payjoin.PlainOutPoint, currentBip21: string, newInputs: Set<string>): boolean {
   logger.debug(isKnown, 'checking if outpoint is known:', outpoint);
 
-  const cachedBip21 = knownInputsCache.get(outpoint);
-  
+  const outpointKey = `${outpoint.txid}:${outpoint.vout}`;
+
+  const cachedBip21 = knownInputsCache.get(outpointKey);
+
   if (cachedBip21 === undefined) {
     // Input has never been seen before
     logger.debug(isKnown, 'outpoint is not known (cache):', outpoint);
-    newInputs.add(outpoint);
+    newInputs.add(outpointKey);
     return false;
   }
-  
+
   if (cachedBip21 === currentBip21 || cachedBip21 === '') {
     // Input seen before with same BIP21 or no BIP21 recorded
     logger.debug(isKnown, 'outpoint is known with same BIP21 (cache):', outpoint);
     return false; // Allow it
   }
-  
+
   // Input seen before with different BIP21
-  logger.debug(isKnown, 'outpoint is known with DIFFERENT BIP21 (cache):', outpoint, 
+  logger.debug(isKnown, 'outpoint is known with DIFFERENT BIP21 (cache):', outpoint,
     'cached:', cachedBip21, 'current:', currentBip21);
   return true; // Deny it - it was seen with a different BIP21
 }
@@ -458,7 +558,7 @@ async function getKnownInputsSet(): Promise<Map<string, string>> {
   return knownInputsCache;
 }
 
-async function saveKnownInputs(bip21: string) {
+async function saveKnownInputs(bip21: string, newInputs: Set<string>) {
   logger.debug(saveKnownInputs, 'saving new inputs:', newInputs);
   const newInputsArray = Array.from(newInputs);
 
@@ -481,7 +581,7 @@ async function saveKnownInputs(bip21: string) {
     });
 
     logger.debug(saveKnownInputs, 'saved new inputs:', newInputsArray);
-    
+
     // Update the cache with new inputs
     for (const input of newInputs) {
       knownInputsCache.set(input, bip21);
@@ -489,9 +589,69 @@ async function saveKnownInputs(bip21: string) {
   } catch (e) {
     logger.error(saveKnownInputs, 'failed to save new inputs:', e);
   }
+}
 
-  // Clear the newInputs set
-  newInputs.clear();
+async function availableInputs(config: Config): Promise<InputPairWithMetadata[]> {
+  const { error: utxosError, result: utxosResult } = await cnClient.listUnspent({ wallet: config.RECEIVE_WALLET });
+  if (utxosError || !utxosResult) {
+    logger.error(availableInputs, 'failed to list unspent:', utxosError);
+    return [];
+  }
+
+  logger.debug(availableInputs, 'found utxos:', utxosResult.utxos.length);
+
+  // sort smallest to largest
+  const sortedUtxos = [...utxosResult.utxos]
+    .filter((utxo) => utxo.confirmations > 0)
+    .sort((a, b) => {
+      return Number(Utils.btcToSats(a.amount) - Utils.btcToSats(b.amount))
+    });
+  logger.debug(availableInputs, 'sorted utxos:', sortedUtxos.length);
+
+  const inputs: InputPairWithMetadata[] = [];
+  for (const utxo of sortedUtxos) {
+    const { error: txError, result: txResult } = await cnClient.getTransaction(utxo.txid);
+    if (txError || !txResult) {
+      logger.error(availableInputs, 'failed to get transaction:', txError);
+      continue;
+    }
+logger.debug(availableInputs, 'got transaction for utxo:', txResult);
+    const txin = payjoin.PlainTxIn.create({
+      previousOutput: payjoin.PlainOutPoint.create({
+        txid: utxo.txid,
+        vout: utxo.vout,
+      }),
+      scriptSig: new Uint8Array([]).buffer,
+      sequence: 0,
+      witness: [],
+    });
+
+    const txOut = payjoin.PlainTxOut.create({
+      valueSat: Utils.btcToSats(utxo.amount),
+      scriptPubkey: new Uint8Array(Buffer.from(utxo.scriptPubKey, "hex")).buffer,
+    });
+    const psbtIn = payjoin.PlainPsbtInput.create({
+        witnessUtxo: txOut,
+        redeemScript: undefined,
+        witnessScript: undefined,
+    });
+logger.debug(availableInputs, 'created input pair for utxo:', txin, psbtIn);
+    inputs.push({
+      inputPair: new payjoin.InputPair(txin, psbtIn, undefined),
+      txid: utxo.txid,
+      vout: utxo.vout,
+      amount: utxo.amount,
+      scriptPubKey: utxo.scriptPubKey,
+    });
+    logger.debug(availableInputs, 'added input pair for utxo:', utxo.txid, utxo.vout);
+
+    // limit to 20 inputs to provide to payjoin library
+    if (inputs.length >= 20) {
+      break;
+    }
+  }
+logger.warn(availableInputs, 'selected inputs:', inputs);
+  return inputs;
 }
 
 function walletProcessPsbt(provisionalPsbt: string, config: Config): string {

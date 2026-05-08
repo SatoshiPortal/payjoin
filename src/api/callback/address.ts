@@ -13,7 +13,7 @@ export function addressCallbackUrl(type: "send" | "receive", address: string) {
 export async function handleAddressCallback(data: any, type: "send" | "receive") {
   logger.info(handleAddressCallback, "address callback:", JSON.stringify(data, null, 2));
 
-  lock.acquire(data.address, async () => {
+  await lock.acquire(data.address, async () => {
     const prismaModel: any = type === "send" ? db.send : db.receive;
     try {
       let payjoin = await prismaModel.findFirst({

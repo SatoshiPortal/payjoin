@@ -104,7 +104,9 @@ class Utils {
       throw new Error("Invalid number");
     }
 
-    return BigInt(Math.floor(Number(btc) * 1e8));
+    const [intPart, fracPart = ''] = String(btc).split('.');
+    const paddedFrac = fracPart.padEnd(8, '0').slice(0, 8);
+    return BigInt(intPart) * 100_000_000n + BigInt(paddedFrac);
   }
 
   static jsonReplacer(key: string, value: any): any {

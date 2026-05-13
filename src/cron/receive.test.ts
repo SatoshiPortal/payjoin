@@ -1,4 +1,4 @@
-import { broadcastFallback } from './receive';
+import { broadcastFallback, sumReceiverInputs } from './receive';
 import { Receive } from '@prisma/client';
 import { Config } from '../config';
 
@@ -123,7 +123,53 @@ beforeEach(() => {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('broadcastFallback — output substitution address bug (SECURITY_REVIEW high finding)', () => {
+// ---------------------------------------------------------------------------
+// sumReceiverInputs — outpoint matching
+// ---------------------------------------------------------------------------
+
+describe('sumReceiverInputs — receiver input matched by outpoint not scriptPubKey', () => {
+
+  const SHARED_SCRIPT = 'aabbcc'; // same scriptPubKey on both UTXOs (address reuse)
+
+  const vin = [
+    { txid: 'aaaa', vout: 0 }, // sender input
+    { txid: 'bbbb', vout: 1 }, // receiver contributed UTXO
+    { txid: 'bbbb', vout: 2 }, // second UTXO at same address — NOT contributed
+  ];
+
+  const psbtInputs = [
+    { witness_utxo: { amount: 0.5,    scriptPubKey: { hex: SHARED_SCRIPT } } }, // sender
+    { witness_utxo: { amount: 0.001,  scriptPubKey: { hex: SHARED_SCRIPT } } }, // receiver contributed
+    { witness_utxo: { amount: 0.0005, scriptPubKey: { hex: SHARED_SCRIPT } } }, // NOT contributed
+  ];
+
+  // Only bbbb:1 was contributed — value = 100 000 sats
+  const contributedInputs = [{ txid: 'bbbb', vout: 1 }];
+
+  it('counts only the contributed UTXO when address reuse exists', () => {
+    const result = sumReceiverInputs(psbtInputs, vin, contributedInputs);
+    expect(result).toBe(100_000n); // 0.001 BTC — only bbbb:1
+  });
+
+  it('returns 0n when no contributed inputs are in the PSBT', () => {
+    const result = sumReceiverInputs(psbtInputs, vin, [{ txid: 'cccc', vout: 0 }]);
+    expect(result).toBe(0n);
+  });
+
+  it('handles uppercase hex in scriptPubKey without silently returning 0', () => {
+    // scriptPubKey hex returned by Bitcoin Core may be uppercase; outpoint matching
+    // is unaffected by case — the old scriptPubKey comparison would silently fail.
+    const upperCasePsbtInputs = psbtInputs.map(i => ({
+      ...i,
+      witness_utxo: { ...i.witness_utxo, scriptPubKey: { hex: SHARED_SCRIPT.toUpperCase() } },
+    }));
+    const result = sumReceiverInputs(upperCasePsbtInputs, vin, contributedInputs);
+    expect(result).toBe(100_000n); // still correct — outpoint is case-insensitive
+  });
+
+});
+
+describe('broadcastFallback — output substitution address bug', () => {
 
   /**
    * GREEN anchor — the non-substituted case already works correctly.

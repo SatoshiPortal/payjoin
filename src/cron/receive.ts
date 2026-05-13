@@ -360,18 +360,11 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
         logger.debug(processReceiveSession, 'total fee:', totalFee);
 
-        receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
-          return (
-            input.witness_utxo &&
-            input.witness_utxo.amount &&
-            inputs.some((possibleInput: InputPairWithMetadata) => {
-              logger.debug(processReceiveSession, 'comparing possible input:', possibleInput.scriptPubKey, possibleInput.amount, 'with input:', input.witness_utxo?.scriptPubKey, input.witness_utxo?.amount);
-              return possibleInput.scriptPubKey === input.witness_utxo?.scriptPubKey.hex;
-            })
-          );
-        }).reduce((acc, input) => {
-          return acc + Utils.btcToSats(input.witness_utxo?.amount || 0);
-        }, 0n);
+        receiverTotalInputAmount = sumReceiverInputs(
+          decodedFinalPsbtResult.inputs,
+          decodedFinalPsbtResult.tx.vin,
+          inputs,
+        );
         logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
 
         receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
@@ -715,6 +708,26 @@ function walletProcessPsbt(provisionalPsbt: string, config: Config): string {
     logger.debug(walletProcessPsbt, 'processed psbt:', processResult);
 
     return processResult.psbt;
+}
+
+/**
+ * Sum the value of PSBT inputs that belong to the receiver, identified by outpoint
+ * (txid + vout index). `psbtInputs` and `vin` are parallel arrays from `decodePsbt`.
+ */
+export function sumReceiverInputs(
+  psbtInputs: Array<{ witness_utxo?: { amount: number } }>,
+  vin: Array<{ txid: string; vout: number }>,
+  contributedInputs: Array<{ txid: string; vout: number | bigint }>,
+): bigint {
+  return psbtInputs.reduce((acc, input, index) => {
+    if (!input.witness_utxo?.amount) return acc;
+    const outpoint = vin[index];
+    if (!outpoint) return acc;
+    const isOurs = contributedInputs.some(
+      (c) => c.txid === outpoint.txid && Number(c.vout) === outpoint.vout,
+    );
+    return isOurs ? acc + Utils.btcToSats(input.witness_utxo.amount) : acc;
+  }, 0n);
 }
 
 export async function broadcastFallback(receiveSess: Receive, config: Config) {

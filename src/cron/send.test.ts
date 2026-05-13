@@ -99,7 +99,7 @@ function setupMocks(feeRateSatVbyte: number, vsizeVbytes = 200) {
 
 beforeEach(() => jest.clearAllMocks());
 
-describe('validateAndBroadcastPayjoinPsbt — fee-rate guard (SECURITY_REVIEW critical finding)', () => {
+describe('validateAndBroadcastPayjoinPsbt — fee-rate guard', () => {
 
   /**
    * RED TEST — this test documents the security gap and is expected to FAIL

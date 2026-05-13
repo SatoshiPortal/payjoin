@@ -90,6 +90,11 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       persister.restore(JSON.parse(receiveSess.session || '[]'));
       const replayResult = payjoin.replayReceiverEventLog(persister);
 
+      // capture before any output substitution may update receiveSess.address
+      const originalReceiverAddress = receiveSess.address;
+      // amount the sender is paying us in the original (fallback) tx — set in OutputsUnknown
+      let senderPaymentAmount = 0n;
+
       const restoredReceiver = replayResult.state();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let receiver: any = restoredReceiver.inner.inner;
@@ -206,13 +211,18 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.info(processReceiveSession, 'decoded fallback tx:', decodeResult);
 
         const receiverOutputs = decodeResult.tx.vout
-          .filter(vout => vout.scriptPubKey.address === receiveSess.address)
+          .filter(vout => vout.scriptPubKey.address === originalReceiverAddress)
           .map((vout) => {
             return [
               vout.n,
               vout.scriptPubKey.hex,
             ] as [number, string];
           });
+
+        senderPaymentAmount = decodeResult.tx.vout
+          .filter(vout => vout.scriptPubKey.address === originalReceiverAddress)
+          .reduce((acc, vout) => acc + Utils.btcToSats(vout.value), 0n);
+        logger.debug(processReceiveSession, 'sender payment amount from fallback tx:', senderPaymentAmount);
 
         const isReceiverOutput = (script: ArrayBuffer): boolean => {
           const scriptHex = arrayBufferToHex(script);
@@ -320,13 +330,99 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         const finalPsbt = receiver.psbt();
         logger.info(processReceiveSession, 'finalized proposal psbt:', finalPsbt);
 
+        // Decode and validate amounts BEFORE sending the proposal so we can abort cleanly
+        // if the receiver would lose money.
+        const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
+        if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
+          logger.error(processReceiveSession, 'failed to decode final psbt:', decodedFinalPsbtError);
+          await db.receive.updateMany({ where: { id: receiveSess.id, failedTs: null }, data: { failedTs: new Date(), failedReason: `decode_psbt_failed: ${decodedFinalPsbtError}` } });
+          return;
+        }
+
+        let totalFee = 0n, receiverFee = 0n, receiverTotalInputAmount = 0n, receiverTotalOutputAmount = 0n;
+
+        totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
+        logger.debug(processReceiveSession, 'total fee:', totalFee);
+
+        receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
+          return (
+            input.witness_utxo &&
+            input.witness_utxo.amount &&
+            inputs.some((possibleInput: InputPairWithMetadata) => {
+              logger.debug(processReceiveSession, 'comparing possible input:', possibleInput.scriptPubKey, possibleInput.amount, 'with input:', input.witness_utxo?.scriptPubKey, input.witness_utxo?.amount);
+              return possibleInput.scriptPubKey === input.witness_utxo?.scriptPubKey.hex;
+            })
+          );
+        }).reduce((acc, input) => {
+          return acc + Utils.btcToSats(input.witness_utxo?.amount || 0);
+        }, 0n);
+        logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
+
+        receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
+          if (output.scriptPubKey.address === effectiveReceiverAddress) {
+            return acc + Utils.btcToSats(output.value);
+          }
+          return acc;
+        }, 0n);
+        logger.debug(processReceiveSession, 'total receiver output amount:', receiverTotalOutputAmount);
+
+        const netReceived = receiverTotalOutputAmount - receiverTotalInputAmount;
+
+        if (netReceived < 0n) {
+          logger.error(processReceiveSession, `receiver would lose ${-netReceived} sats (netReceived < 0) — aborting without sending proposal`);
+          // use updateMany with failedTs: null so we only stamp it once — if we unconditionally
+          // overwrite it on every retry, failedTs never ages past the 2-min threshold and
+          // broadcastFallback can never run
+          await db.receive.updateMany({ where: { id: receiveSess.id, failedTs: null }, data: { failedTs: new Date(), failedReason: `net_negative: receiver would lose ${-netReceived} sats` } });
+          return;
+        }
+
+        // if OutputsUnknown was skipped (restored session), re-derive sender payment from fallback tx
+        if (senderPaymentAmount === 0n && receiveSess.fallbackTxHex) {
+          const { error: fbError, result: fbResult } = await cnClient.decodeRawTransaction({ hex: receiveSess.fallbackTxHex });
+          if (fbError || !fbResult) {
+            logger.warn(processReceiveSession, 'could not decode fallback tx to compute sender payment:', fbError);
+          } else {
+            senderPaymentAmount = fbResult.tx.vout
+              .filter(vout => vout.scriptPubKey.address === originalReceiverAddress)
+              .reduce((acc, vout) => acc + Utils.btcToSats(vout.value), 0n);
+          }
+        }
+
+        // fee absorbed by receiver = what sender actually paid minus what receiver netted
+        receiverFee = senderPaymentAmount - netReceived;
+        logger.debug(processReceiveSession, 'receiver fee:', receiverFee, 'sender payment:', senderPaymentAmount, 'net received:', netReceived);
+
+        // if the sender paid a different amount, record what was actually received
+        const calculatedAmount = netReceived;
+        let updateAmount = receiveSess.amount;
+        const tolerance = 10n;
+        const difference = calculatedAmount > receiveSess.amount
+          ? calculatedAmount - receiveSess.amount
+          : receiveSess.amount - calculatedAmount;
+
+        if (difference > tolerance) {
+          logger.warn(
+            processReceiveSession,
+            `net received differs from expected by ${difference} sats: ` +
+            `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
+          );
+          updateAmount = calculatedAmount;
+        } else if (difference > 0n) {
+          logger.info(
+            processReceiveSession,
+            `net received differs from expected by ${difference} sats (within ${tolerance} tolerance): ` +
+            `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
+          );
+        }
+
+        const txid = decodedFinalPsbtResult.tx.txid;
+        logger.debug(processReceiveSession, 'proposal txid:', txid);
+
         // lock utxos using utxosToBeLocked
         const toLock = receiver.utxosToBeLocked();
         logger.debug(processReceiveSession, 'utxos to be locked:', toLock);
 
-        // lock the inputs used in the payjoin tx
-        // Note: we might have to be careful with these locks. If the payjoin fails below this point
-        // we may end up with "orphand" locks.
         if (toLock && toLock.length > 0) {
           const lockUtxos = toLock.map((utxo) => {
             const { txid, vout } = utxo;
@@ -336,7 +432,6 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
             }
           });
 
-          // loop over them and lock individually in case any of them fail
           for (const utxo of lockUtxos) {
             await cnClient.lockUnspent({ utxos: [utxo], wallet: config.RECEIVE_WALLET });
           }
@@ -352,87 +447,20 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         // Fallback tx broadcast is handled separately after a timeout if the payjoin tx is not seen.
         const result = receiver.processResponse(responseBuffer, rr.clientResponse).save(persister);
         logger.debug(processReceiveSession, 'processed proposal response:', result);
-        
-        const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
-        if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
-          logger.error(processReceiveSession, 'failed to decode final psbt:', decodedFinalPsbtError);
-        } else {
-          let totalFee = 0n, receiverFee = 0n, receiverTotalInputAmount = 0n, receiverTotalOutputAmount = 0n;
 
-          // full fee for the transaction
-          totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
-          logger.debug(processReceiveSession, 'total fee:', totalFee);
-
-          // total the amount of all of our inputs
-          receiverTotalInputAmount = decodedFinalPsbtResult.inputs.filter((input) => {
-            return (
-              input.witness_utxo &&
-              input.witness_utxo.amount &&
-              // this is one our candidate inputs we provided above - i.e. we own it
-              inputs.some((possibleInput: InputPairWithMetadata) => {
-                logger.debug(processReceiveSession, 'comparing possible input:', possibleInput.scriptPubKey, possibleInput.amount, 'with input:', input.witness_utxo?.scriptPubKey, input.witness_utxo?.amount);
-                return possibleInput.scriptPubKey === input.witness_utxo?.scriptPubKey.hex;
-              })
-            );
-          }).reduce((acc, input) => {
-            return acc + Utils.btcToSats(input.witness_utxo?.amount || 0);
-          }, 0n);
-          logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
-
-          // get the amount of our output (use effectiveReceiverAddress to handle output substitution)
-          receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
-            if (output.scriptPubKey.address === effectiveReceiverAddress) {
-              return acc + Utils.btcToSats(output.value);
+        if (txid) {
+          const updateResult = await db.receive.update({
+            where: { id: receiveSess.id },
+            data: {
+              txid,
+              amount: updateAmount,
+              fee: totalFee,
+              receiverFee,
+              receiverInAmount: receiverTotalInputAmount,
+              receiverOutAmount: receiverTotalOutputAmount,
             }
-            return acc;
-          }, 0n);
-          logger.debug(processReceiveSession, 'total receiver output amount:', receiverTotalOutputAmount);
-
-          // net amount received = outputs - contributed inputs
-          // receiverFee = expected payment - net received (positive means receiver paid fees)
-          const netReceived = receiverTotalOutputAmount - receiverTotalInputAmount;
-          receiverFee = receiveSess.amount - netReceived;
-          logger.debug(processReceiveSession, 'receiver fee:', receiverFee, 'net received:', netReceived);
-
-          // verify net received is close to the expected payment amount
-          const calculatedAmount = netReceived;
-          let updateAmount = receiveSess.amount;
-          const tolerance = 10n;
-          const difference = calculatedAmount > receiveSess.amount
-            ? calculatedAmount - receiveSess.amount
-            : receiveSess.amount - calculatedAmount;
-
-          if (difference > tolerance) {
-            logger.error(
-              processReceiveSession,
-              `net received differs from expected by ${difference} sats (more than ${tolerance} tolerance): ` +
-              `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
-            );
-            updateAmount = calculatedAmount;
-          } else if (difference > 0n) {
-            logger.info(
-              processReceiveSession,
-              `net received differs from expected by ${difference} sats (within ${tolerance} tolerance): ` +
-              `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
-            );
-          }
-
-          const txid = decodedFinalPsbtResult.tx.txid;
-          logger.debug(processReceiveSession, 'updated proposal txid:', txid);
-          if (txid) {
-            const updateResult = await db.receive.update({
-              where: { id: receiveSess.id },
-              data: {
-                txid,
-                amount: updateAmount,
-                fee: totalFee,
-                receiverFee,
-                receiverInAmount: receiverTotalInputAmount,
-                receiverOutAmount: receiverTotalOutputAmount,
-              }
-            });
-            logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);
-          }
+          });
+          logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);
         }
       }
 
@@ -443,6 +471,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         where: { id: receiveSess.id, failedTs: null },
         data: {
           failedTs: new Date(),
+          failedReason: `exception: ${e instanceof Error ? e.message : String(e)}`,
         }
       }).catch((e) => {
         logger.error(processReceiveSession, 'failed to update session with failed timestamp:', e);
@@ -680,6 +709,17 @@ async function broadcastFallback(receiveSess: Receive, config: Config) {
     return;
   }
 
+  const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: receiveSess.fallbackTxHex });
+  if (decodeError || !decodeResult) {
+    logger.error(broadcastFallback, 'failed to decode fallback tx:', decodeError);
+    return;
+  }
+
+  const fallbackAmount = decodeResult.tx.vout
+    .filter(vout => vout.scriptPubKey.address === receiveSess.address)
+    .reduce((acc, vout) => acc + Utils.btcToSats(vout.value), 0n);
+  logger.info(broadcastFallback, 'fallback amount to receiver:', fallbackAmount);
+
   const { error: sendError, result: sendResult } = await cnClient.sendRawTransaction({
     hex: receiveSess.fallbackTxHex,
     wallet: config.RECEIVE_WALLET,
@@ -692,12 +732,13 @@ async function broadcastFallback(receiveSess: Receive, config: Config) {
 
   logger.info(broadcastFallback, 'broadcasted fallback tx:', sendResult);
 
-  // update the receive session with the txid
+  // update the receive session with the txid and actual received amount from the fallback tx
   const updatedReceive = await db.receive.update({
     where: { id: receiveSess.id },
     data: {
       txid: sendResult,
       fallbackTs: new Date(),
+      amount: fallbackAmount,
     }
   });
   logger.info(broadcastFallback, 'updated receive session with txid:', sendResult, updatedReceive.id);

@@ -62,6 +62,7 @@ model Receive {
   nonPayjoinTs        DateTime?     @map("non_payjoin_ts")
   confirmedTs         DateTime?     @map("confirmed_ts")
   failedTs            DateTime?     @map("failed_ts")
+  failedReason        String?       @map("failed_reason")
   createdTs           DateTime      @default(now()) @map("created_ts")
   updatedTs           DateTime      @updatedAt @map("updated_ts")
 

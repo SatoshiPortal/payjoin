@@ -701,7 +701,7 @@ function walletProcessPsbt(provisionalPsbt: string, config: Config): string {
     return processResult.psbt;
 }
 
-async function broadcastFallback(receiveSess: Receive, config: Config) {
+export async function broadcastFallback(receiveSess: Receive, config: Config) {
   logger.debug(broadcastFallback, 'broadcasting fallback tx for receiveSess:', receiveSess.id);
 
   if (!receiveSess.fallbackTxHex) {
@@ -715,8 +715,16 @@ async function broadcastFallback(receiveSess: Receive, config: Config) {
     return;
   }
 
+  // The sender always pays the original BIP21 address regardless of whether
+  // we later substituted our output to a fresh address. receiveSess.address
+  // may have been updated during output substitution, so derive the original
+  // receiver address from the stored BIP21 instead.
+  const originalAddress = receiveSess.bip21
+    ? receiveSess.bip21.replace(/^bitcoin:/i, '').split('?')[0]
+    : receiveSess.address;
+
   const fallbackAmount = decodeResult.tx.vout
-    .filter(vout => vout.scriptPubKey.address === receiveSess.address)
+    .filter(vout => vout.scriptPubKey.address === originalAddress)
     .reduce((acc, vout) => acc + Utils.btcToSats(vout.value), 0n);
   logger.info(broadcastFallback, 'fallback amount to receiver:', fallbackAmount);
 

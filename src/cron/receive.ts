@@ -293,6 +293,22 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         const inputPairs = inputs.map((input) => input.inputPair);
         const selectedInput = receiver.tryPreservingPrivacy(inputPairs);
         logger.debug("SELECTED INPUT:", selectedInput, JSON.stringify(selectedInput));
+
+        // Lock the selected UTXO BEFORE signing to close the race window where
+        // two concurrent sessions could both select and sign with the same UTXO.
+        // indexOf uses identity (===) — works as long as the SDK returns the same
+        // InputPair reference it was given, which the WASM bindings do.
+        // Cast to InputPairLike[] so indexOf accepts the InputPairLike return type
+        // from tryPreservingPrivacy without a type error.
+        const selectedIndex = (inputPairs as payjoin.InputPairLike[]).indexOf(selectedInput);
+        if (selectedIndex >= 0) {
+          const { txid, vout } = inputs[selectedIndex];
+          logger.info(processReceiveSession, 'locking selected input before signing:', txid, vout);
+          await cnClient.lockUnspent({ utxos: [{ txid, vout: Number(vout) }], wallet: config.RECEIVE_WALLET });
+        } else {
+          logger.warn(processReceiveSession, 'could not match selected InputPair to metadata — UTXO lock deferred to after signing');
+        }
+
         receiver = receiver.contributeInputs([selectedInput])
           .commitInputs()
           .save(persister);

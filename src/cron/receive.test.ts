@@ -1,4 +1,4 @@
-import { broadcastFallback, sumReceiverInputs } from './receive';
+import { broadcastFallback, sumReceiverInputs, isKnownProbe } from './receive';
 import { Receive } from '@prisma/client';
 import { Config } from '../config';
 
@@ -122,6 +122,60 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// isKnownProbe — probing detection
+// ---------------------------------------------------------------------------
+
+describe('isKnownProbe — probing detection with session-local map', () => {
+
+  const BIP21_A = 'bitcoin:bc1qaaa?amount=0.001&pj=https://example.com';
+  const BIP21_B = 'bitcoin:bc1qbbb?amount=0.001&pj=https://example.com';
+  const outpoint = { txid: 'deadbeef', vout: 0n };
+
+  it('returns false and records outpoint when never seen before', () => {
+    const seenMap = new Map<string, string>();
+    const newInputs = new Set<string>();
+
+    const result = isKnownProbe(outpoint, BIP21_A, newInputs, seenMap);
+
+    expect(result).toBe(false);
+    expect(newInputs.has('deadbeef:0')).toBe(true);
+  });
+
+  it('returns false when outpoint was seen with the same BIP21', () => {
+    const seenMap = new Map([['deadbeef:0', BIP21_A]]);
+    const newInputs = new Set<string>();
+
+    expect(isKnownProbe(outpoint, BIP21_A, newInputs, seenMap)).toBe(false);
+  });
+
+  it('returns false when outpoint was seen with no BIP21 recorded', () => {
+    const seenMap = new Map([['deadbeef:0', '']]);
+    const newInputs = new Set<string>();
+
+    expect(isKnownProbe(outpoint, BIP21_A, newInputs, seenMap)).toBe(false);
+  });
+
+  it('returns true (probe detected) when outpoint was seen with a different BIP21', () => {
+    // Input X was already used in session for BIP21_A.
+    // Now a sender is presenting the same input for BIP21_B — classic probing attack.
+    const seenMap = new Map([['deadbeef:0', BIP21_A]]);
+    const newInputs = new Set<string>();
+
+    expect(isKnownProbe(outpoint, BIP21_B, newInputs, seenMap)).toBe(true);
+  });
+
+  it('does not add outpoint to newInputs when it was already seen', () => {
+    const seenMap = new Map([['deadbeef:0', BIP21_A]]);
+    const newInputs = new Set<string>();
+
+    isKnownProbe(outpoint, BIP21_A, newInputs, seenMap);
+
+    expect(newInputs.size).toBe(0);
+  });
+
+});
 
 // ---------------------------------------------------------------------------
 // sumReceiverInputs — outpoint matching

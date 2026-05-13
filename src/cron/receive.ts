@@ -9,12 +9,6 @@ import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse } from "../li
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 
-// used to cache and store known (or "seen") inputs
-// which are used to determine someone is attempting a probing attack
-let knownInputsCache: Map<string, string> = new Map();
-let lastCacheUpdateTime = 0;
-const CACHE_TTL = 60000; // 1 minute in milliseconds
-
   interface InputPairWithMetadata {
     inputPair: payjoin.InputPair;
     txid: string;
@@ -25,6 +19,8 @@ const CACHE_TTL = 60000; // 1 minute in milliseconds
 
 export async function restoreReceiveSessions(config: Config) {
   logger.info(restoreReceiveSessions, 'restoring receive sessions');
+
+  await cleanupSeenInputs(Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000);
 
   const { replicaId, totalReplicas } = Utils.replicaInfo();
 
@@ -81,9 +77,6 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       logger.info(processReceiveSession, 'session already has txid:', receiveSess.txid);
       return;
     }
-
-    // populate the known inputs cache
-    await getKnownInputsSet().catch(logger.error);
 
     try {
       const persister = new ReceiverPersister({ id: receiveSess.id, db });
@@ -153,12 +146,12 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.MaybeInputsSeen) {
         logger.debug(processReceiveSession, 'Receiver is in MaybeInputsSeen state');
 
+        const seenInputsMap = await loadSeenInputsFromDb(Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000);
         const sessionNewInputs = new Set<string>();
         receiver = receiver.checkNoInputsSeenBefore(
-          { callback: (outpoint: payjoin.PlainOutPoint) => isKnown(outpoint, receiveSess.bip21!, sessionNewInputs) }
+          { callback: (outpoint: payjoin.PlainOutPoint) => isKnownProbe(outpoint, receiveSess.bip21!, sessionNewInputs, seenInputsMap) }
         ).save(persister);
 
-        // save any new "seen" inputs to the database and add to cache
         await saveKnownInputs(receiveSess.bip21!, sessionNewInputs);
 
         logger.debug('checkNoInputsSeenBefore complete');
@@ -547,83 +540,58 @@ function isOwned(script: ArrayBuffer, config: Config): boolean {
   return false;
 }
 
-function isKnown(outpoint: payjoin.PlainOutPoint, currentBip21: string, newInputs: Set<string>): boolean {
-  logger.debug(isKnown, 'checking if outpoint is known:', outpoint);
-
+export function isKnownProbe(
+  outpoint: { txid: string; vout: number | bigint },
+  currentBip21: string,
+  newInputs: Set<string>,
+  seenInputsMap: Map<string, string>,
+): boolean {
   const outpointKey = `${outpoint.txid}:${outpoint.vout}`;
+  const seenBip21 = seenInputsMap.get(outpointKey);
 
-  const cachedBip21 = knownInputsCache.get(outpointKey);
-
-  if (cachedBip21 === undefined) {
-    // Input has never been seen before
-    logger.debug(isKnown, 'outpoint is not known (cache):', outpoint);
+  if (seenBip21 === undefined) {
     newInputs.add(outpointKey);
     return false;
   }
 
-  if (cachedBip21 === currentBip21 || cachedBip21 === '') {
-    // Input seen before with same BIP21 or no BIP21 recorded
-    logger.debug(isKnown, 'outpoint is known with same BIP21 (cache):', outpoint);
-    return false; // Allow it
+  if (seenBip21 === currentBip21 || seenBip21 === '') {
+    return false;
   }
 
-  // Input seen before with different BIP21
-  logger.debug(isKnown, 'outpoint is known with DIFFERENT BIP21 (cache):', outpoint,
-    'cached:', cachedBip21, 'current:', currentBip21);
-  return true; // Deny it - it was seen with a different BIP21
+  logger.debug(isKnownProbe, 'probe detected — outpoint seen with different BIP21:',
+    outpointKey, 'seen:', seenBip21, 'current:', currentBip21);
+  return true;
 }
 
-async function getKnownInputsSet(): Promise<Map<string, string>> {
-  const now = Date.now();
-  
-  // If cache is fresh enough, use it
-  if (now - lastCacheUpdateTime < CACHE_TTL) {
-    return knownInputsCache;
-  }
-  
-  // Otherwise refresh the cache
+async function loadSeenInputsFromDb(expiryWindowMs: number): Promise<Map<string, string>> {
+  const cutoff = new Date(Date.now() - expiryWindowMs);
+  const recentInputs = await db.seenInputs.findMany({ where: { createdTs: { gt: cutoff } } });
+  return new Map(recentInputs.map(input => [`${input.txid}:${input.vout}`, input.bip21 || '']));
+}
+
+async function cleanupSeenInputs(expiryWindowMs: number): Promise<void> {
+  const cutoff = new Date(Date.now() - expiryWindowMs);
   try {
-    const allSeenInputs = await db.seenInputs.findMany();
-    knownInputsCache = new Map(
-      allSeenInputs.map(input => [`${input.txid}:${input.vout}`, input.bip21 || ''])
-    );
-    lastCacheUpdateTime = now;
-    logger.info(`Updated known inputs cache with ${knownInputsCache.size} entries`);
+    const { count } = await db.seenInputs.deleteMany({ where: { createdTs: { lte: cutoff } } });
+    if (count > 0) logger.info(cleanupSeenInputs, `deleted ${count} expired seen_inputs rows`);
   } catch (e) {
-    logger.error('Failed to update known inputs cache:', e);
+    logger.error(cleanupSeenInputs, 'failed to clean up seen_inputs:', e);
   }
-  
-  return knownInputsCache;
 }
 
 async function saveKnownInputs(bip21: string, newInputs: Set<string>) {
-  logger.debug(saveKnownInputs, 'saving new inputs:', newInputs);
   const newInputsArray = Array.from(newInputs);
-
-  if (newInputsArray.length === 0) {
-    logger.debug(saveKnownInputs, 'no new inputs to save');
-    return;
-  }
+  if (newInputsArray.length === 0) return;
 
   try {
     await db.seenInputs.createMany({
       data: newInputsArray.map((input) => {
         const [txid, vout] = input.split(':');
-        return {
-          txid,
-          vout: Number(vout),
-          bip21,
-        }
+        return { txid, vout: Number(vout), bip21 };
       }),
       skipDuplicates: true,
     });
-
     logger.debug(saveKnownInputs, 'saved new inputs:', newInputsArray);
-
-    // Update the cache with new inputs
-    for (const input of newInputs) {
-      knownInputsCache.set(input, bip21);
-    }
   } catch (e) {
     logger.error(saveKnownInputs, 'failed to save new inputs:', e);
   }

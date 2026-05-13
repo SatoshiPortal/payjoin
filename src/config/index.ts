@@ -17,6 +17,7 @@ export interface Config {
   OHTTP_RELAYS: string[]; // ordered list of ohttp relay URLs to try in sequence
   OHTTP_RELAY_TIMEOUT_MS: number; // per-relay timeout in milliseconds when attempting fallback
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
+  MAX_PAYJOIN_FEE_RATE: number; // sat/vbyte — reject payjoin proposals whose fee rate exceeds this ceiling
 }
 
 export let config: Config = {
@@ -34,6 +35,7 @@ export let config: Config = {
   OHTTP_RELAYS: process.env.OHTTP_RELAYS ? process.env.OHTTP_RELAYS.split(',').map(s => s.trim()) : ["https://ohttp.cakewallet.com", "https://pj.benalleng.com", "https://pj.bobspacebkk.com"],
   OHTTP_RELAY_TIMEOUT_MS: Number(process.env.OHTTP_RELAY_TIMEOUT_MS || 10000),
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
+  MAX_PAYJOIN_FEE_RATE: Number(process.env.MAX_PAYJOIN_FEE_RATE || 500), // 500 sat/vbyte default
 };
 
 export function reloadConfig(): Config {

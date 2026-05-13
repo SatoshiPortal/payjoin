@@ -87,99 +87,7 @@ export async function processSendSession(sendSess: Send, config: Config) {
         logger.debug(processSendSession, 'Received proposal PSBT');
         const psbtBase64 = outcome.inner.psbtBase64;
 
-        const { error: processedError, result: processedResult } = await cnClient.processPsbt({
-          psbt: psbtBase64,
-          finalize: true,
-          sign: true,
-          wallet: config.SEND_WALLET
-        });
-
-        if (processedError || !processedResult) {
-          logger.error(processSendSession, 'failed to process psbt:', processedError);
-          return;
-        }
-
-        if (!processedResult.complete) {
-          logger.error(processSendSession, 'payjoin proposal PSBT could not be fully signed', processedResult);
-          return;
-        }
-
-        const { error: finalizeError, result: finalizeResult } = await cnClient.finalizePsbt({
-          psbt: processedResult.psbt,
-          extract: true,
-          wallet: config.SEND_WALLET
-        });
-
-        if (finalizeError || !finalizeResult) {
-          logger.error(processSendSession, 'failed to finalize psbt:', finalizeError);
-          return;
-        }
-
-        if (!finalizeResult.hex) {
-          logger.error(processSendSession, 'failed to extract transaction hex:', finalizeResult);
-          return;
-        }
-
-        const { error: sendError, result: sendResult } = await cnClient.sendRawTransaction({
-          hex: finalizeResult.hex,
-          wallet: config.SEND_WALLET
-        });
-
-        if (sendError) {
-          logger.error(processSendSession, 'failed to send transaction:', sendError);
-          return;
-        }
-
-        let totalFee = 0n, senderFee = 0n, senderTotalInputAmount = 0n, senderTotalOutputAmount = 0n;
-        const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: processedResult.psbt! });
-        if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
-          logger.error(processSendSession, 'failed to decode final psbt:', decodedFinalPsbtError);
-        } else {
-          totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
-          logger.debug(processSendSession, 'total fee:', totalFee);
-
-          senderTotalInputAmount = decodedFinalPsbtResult.inputs
-            .filter((input) =>
-              input.witness_utxo &&
-              input.witness_utxo.scriptPubKey.address &&
-              isAddressOwned(input.witness_utxo.scriptPubKey.address, config)
-            )
-            .reduce((acc, input) => acc + Utils.btcToSats(input.witness_utxo?.amount || 0), 0n);
-          logger.debug(processSendSession, 'total sender input amount:', senderTotalInputAmount);
-
-          senderTotalOutputAmount = decodedFinalPsbtResult.tx.vout
-            .filter((output) =>
-              output.scriptPubKey.address &&
-              isAddressOwned(output.scriptPubKey.address, config)
-            )
-            .reduce((acc, output) => acc + Utils.btcToSats(output.value || 0), 0n);
-          logger.debug(processSendSession, 'total sender output amount:', senderTotalOutputAmount);
-
-          const rawFee = senderTotalInputAmount - senderTotalOutputAmount - sendSess.amount;
-          senderFee = rawFee >= 0n ? rawFee : 0n;
-          if (rawFee < 0n) {
-            logger.warn(processSendSession, 'sender fee calculation produced negative value — address ownership may be misclassified:', rawFee);
-          }
-          logger.debug(processSendSession, 'sender fee:', senderFee);
-        }
-
-        if (sendResult) {
-          const updateResult = await db.send.update({
-            where: { id: sendSess.id },
-            data: {
-              txid: sendResult,
-              fee: totalFee,
-              senderFee,
-              senderInAmount: senderTotalInputAmount,
-              senderOutAmount: senderTotalOutputAmount,
-            }
-          });
-
-          logger.info(processSendSession, 'updated session with txid:', sendResult);
-          logger.info(processSendSession, 'updated session:', updateResult);
-        } else {
-          logger.error(processSendSession, 'broadcast succeeded but no txid returned');
-        }
+        await validateAndBroadcastPayjoinPsbt(psbtBase64, sendSess, config);
 
         return;
       }
@@ -190,6 +98,122 @@ export async function processSendSession(sendSess: Send, config: Config) {
       logger.error(processSendSession, 'failed to restore session:', e);
     }
   });
+}
+
+export async function validateAndBroadcastPayjoinPsbt(
+  psbtBase64: string,
+  sendSess: Pick<Send, 'id' | 'amount'>,
+  config: Config,
+): Promise<void> {
+  // Decode the proposal PSBT before signing so we can gate on fee rate.
+  // The same decoded result is reused for post-broadcast accounting.
+  const { error: decodeError, result: decodedProposal } = await cnClient.decodePsbt({ psbt: psbtBase64 });
+  if (decodeError || !decodedProposal) {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'failed to decode proposal psbt:', decodeError);
+    return;
+  }
+
+  const proposedFeeRate = decodedProposal.tx.vsize > 0
+    ? Number(extractFeeFromPsbt(decodedProposal)) / decodedProposal.tx.vsize
+    : 0;
+  logger.info(validateAndBroadcastPayjoinPsbt, 'proposal fee rate (sat/vbyte):', proposedFeeRate);
+
+  if (proposedFeeRate > config.MAX_PAYJOIN_FEE_RATE) {
+    logger.error(
+      validateAndBroadcastPayjoinPsbt,
+      `proposal fee rate ${proposedFeeRate.toFixed(1)} sat/vbyte exceeds MAX_PAYJOIN_FEE_RATE ` +
+      `${config.MAX_PAYJOIN_FEE_RATE} sat/vbyte — refusing to sign`,
+    );
+    return;
+  }
+
+  const { error: processedError, result: processedResult } = await cnClient.processPsbt({
+    psbt: psbtBase64,
+    finalize: true,
+    sign: true,
+    wallet: config.SEND_WALLET,
+  });
+
+  if (processedError || !processedResult) {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'failed to process psbt:', processedError);
+    return;
+  }
+
+  if (!processedResult.complete) {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'payjoin proposal PSBT could not be fully signed', processedResult);
+    return;
+  }
+
+  const { error: finalizeError, result: finalizeResult } = await cnClient.finalizePsbt({
+    psbt: processedResult.psbt,
+    extract: true,
+    wallet: config.SEND_WALLET,
+  });
+
+  if (finalizeError || !finalizeResult) {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'failed to finalize psbt:', finalizeError);
+    return;
+  }
+
+  if (!finalizeResult.hex) {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'failed to extract transaction hex:', finalizeResult);
+    return;
+  }
+
+  const { error: sendError, result: sendResult } = await cnClient.sendRawTransaction({
+    hex: finalizeResult.hex,
+    wallet: config.SEND_WALLET,
+  });
+
+  if (sendError) {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'failed to send transaction:', sendError);
+    return;
+  }
+
+  // Reuse the pre-sign decode result for fee accounting — input/output amounts
+  // and addresses are identical between the proposal and the signed PSBT.
+  const totalFee = extractFeeFromPsbt(decodedProposal);
+  logger.debug(validateAndBroadcastPayjoinPsbt, 'total fee:', totalFee);
+
+  const senderTotalInputAmount = decodedProposal.inputs
+    .filter((input) =>
+      input.witness_utxo &&
+      input.witness_utxo.scriptPubKey.address &&
+      isAddressOwned(input.witness_utxo.scriptPubKey.address, config)
+    )
+    .reduce((acc, input) => acc + Utils.btcToSats(input.witness_utxo?.amount || 0), 0n);
+  logger.debug(validateAndBroadcastPayjoinPsbt, 'total sender input amount:', senderTotalInputAmount);
+
+  const senderTotalOutputAmount = decodedProposal.tx.vout
+    .filter((output) =>
+      output.scriptPubKey.address &&
+      isAddressOwned(output.scriptPubKey.address, config)
+    )
+    .reduce((acc, output) => acc + Utils.btcToSats(output.value || 0), 0n);
+  logger.debug(validateAndBroadcastPayjoinPsbt, 'total sender output amount:', senderTotalOutputAmount);
+
+  const rawFee = senderTotalInputAmount - senderTotalOutputAmount - sendSess.amount;
+  const senderFee = rawFee >= 0n ? rawFee : 0n;
+  if (rawFee < 0n) {
+    logger.warn(validateAndBroadcastPayjoinPsbt, 'sender fee calculation produced negative value — address ownership may be misclassified:', rawFee);
+  }
+  logger.debug(validateAndBroadcastPayjoinPsbt, 'sender fee:', senderFee);
+
+  if (sendResult) {
+    const updateResult = await db.send.update({
+      where: { id: Number(sendSess.id) },
+      data: {
+        txid: sendResult,
+        fee: totalFee,
+        senderFee,
+        senderInAmount: senderTotalInputAmount,
+        senderOutAmount: senderTotalOutputAmount,
+      },
+    });
+    logger.info(validateAndBroadcastPayjoinPsbt, 'updated session with txid:', sendResult, updateResult);
+  } else {
+    logger.error(validateAndBroadcastPayjoinPsbt, 'broadcast succeeded but no txid returned');
+  }
 }
 
 function isAddressOwned(address: string, config: Config): boolean {

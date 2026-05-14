@@ -15,9 +15,26 @@ import { decodeBech32NoChecksum, decodeU32LE } from "./bech32";
 import { ReceiverPersister, SenderPersister } from "./persister";
 import { db } from "./db";
 
+const recentRelayFailures = new Map<string, number>();
+const RELAY_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+
+export function recordRelayFailure(relay: string): void {
+  recentRelayFailures.set(relay, Date.now());
+}
+
+function relayIsAvailable(relay: string): boolean {
+  const lastFailure = recentRelayFailures.get(relay);
+  if (!lastFailure) return true;
+  return Date.now() - lastFailure > RELAY_FAILURE_COOLDOWN_MS;
+}
+
 export async function withRelayFallback<T>(fn: (relay: string) => Promise<T>): Promise<{ result: T; relay: string }> {
+  // Try healthy relays first, recently-failed ones as last resort
+  const sortedRelays = [...config.OHTTP_RELAYS].sort((a, b) => {
+    return (relayIsAvailable(a) ? 0 : 1) - (relayIsAvailable(b) ? 0 : 1);
+  });
   let lastError: unknown;
-  for (const relay of config.OHTTP_RELAYS) {
+  for (const relay of sortedRelays) {
     try {
       const result = await fn(relay);
       return { result, relay };

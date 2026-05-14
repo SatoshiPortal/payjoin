@@ -5,7 +5,8 @@ import { Config } from "../config";
 import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse } from "../lib/payjoin";
+import { AxiosError } from "axios";
+import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse, recordRelayFailure } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 
@@ -98,7 +99,20 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug(processReceiveSession, 'Receiver is in Initialized state');
 
         const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
-        const responseBuffer = await fetchBufferResponse(rr.request);
+        let responseBuffer: ArrayBuffer;
+        try {
+          responseBuffer = await fetchBufferResponse(rr.request);
+        } catch (e) {
+          // The directory uses a long-poll (~30s) waiting for a sender's proposal.
+          // Our client timeout fires first, producing ECONNABORTED. This is not a
+          // relay failure — it means no sender has appeared yet. Treat it as Stasis
+          // and let the next cron cycle retry rather than stamping failedTs.
+          if (e instanceof AxiosError && e.code === 'ECONNABORTED') {
+            logger.info(processReceiveSession, `poll long-poll timed out — no sender proposal yet, retrying next cycle (session ${receiveSess.id})`);
+            return;
+          }
+          throw e;
+        }
 
         logger.debug(processReceiveSession, 'fetched poll response. About to processResponse');
         const result = receiver.processResponse(responseBuffer, rr.clientResponse).save(persister);
@@ -468,6 +482,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
     } catch (e) {
       logger.error(processReceiveSession, 'failed to restore session:', e);
+
+      if (e instanceof AxiosError && e.code === 'ECONNABORTED' && receiveSess.ohttpRelay) {
+        recordRelayFailure(receiveSess.ohttpRelay);
+      }
 
       await db.receive.updateMany({
         where: { id: receiveSess.id, failedTs: null },

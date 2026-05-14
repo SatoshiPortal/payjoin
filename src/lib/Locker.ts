@@ -139,6 +139,9 @@ export class LockManager {
       logger.error(`[LockManager] Error checking lock status for "${String(lockName)}":`, error);
       return true; // Assume busy on error
     } finally {
+      if ((pgClient as any)._lockManagerErrorHandler) {
+        pgClient.removeListener("error", (pgClient as any)._lockManagerErrorHandler);
+      }
       pgClient.release();
     }
   }

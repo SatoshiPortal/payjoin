@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "module": "commonjs", 
+    "module": "commonjs",
     "esModuleInterop": true,
     "target": "ES2022",
     "noImplicitAny": false,
@@ -18,11 +18,11 @@
     "strict": true,
     "outDir": "./build",
     "sourceRoot": "./src",
+    "types": [
+      "jest",
+      "node"
+    ]
   },
-  "types": [
-    "jest",
-    "node"
-  ],
   "include": ["src/**/*"],
   "exclude": [
     "node_modules"

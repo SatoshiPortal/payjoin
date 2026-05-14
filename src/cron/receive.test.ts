@@ -243,19 +243,6 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(updateArgs.data.txid).toBe(FALLBACK_TXID);
   });
 
-  /**
-   * RED TEST — proves the bug.
-   *
-   * When output substitution occurred, the DB record's `address` field was
-   * updated to the new (substituted) address.  But the sender's fallback tx
-   * still pays the ORIGINAL BIP21 address.
-   *
-   * broadcastFallback filters vouts by `receiveSess.address` (the substituted
-   * one), finds no match, and records amount = 0n.
-   *
-   * This test asserts the CORRECT desired behaviour — it FAILS in the current
-   * codebase, proving the gap exists.
-   */
   it('records correct amount after fallback when output was substituted', async () => {
     // Fallback tx pays the ORIGINAL address (sender built it before substitution).
     cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
@@ -270,6 +257,93 @@ describe('broadcastFallback — output substitution address bug', () => {
     const updateArgs = db.receive.update.mock.calls[0][0];
     expect(updateArgs.data.amount).toBe(FALLBACK_AMOUNT_SATS); // 100 000 sats ✓
     expect(updateArgs.data.txid).toBe(FALLBACK_TXID);
+  });
+
+  it('returns early without broadcasting when fallbackTxHex is absent', async () => {
+    await broadcastFallback(
+      makeReceiveSess({ fallbackTxHex: null }),
+      mockConfig as Config,
+    );
+
+    expect(cnClient.decodeRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('returns early without broadcasting when decodeRawTransaction fails', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue({ result: null, error: { code: -1, message: 'decode error' } });
+
+    await broadcastFallback(makeReceiveSess(), mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('does not update db when sendRawTransaction fails', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+    cnClient.sendRawTransaction.mockResolvedValue({ result: null, error: { code: -25, message: 'bad tx' } });
+
+    await broadcastFallback(makeReceiveSess(), mockConfig as Config);
+
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('uses receiveSess.address when bip21 is null', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+
+    await broadcastFallback(
+      makeReceiveSess({ bip21: null, address: ORIGINAL_ADDRESS }),
+      mockConfig as Config,
+    );
+
+    const updateArgs = db.receive.update.mock.calls[0][0];
+    expect(updateArgs.data.amount).toBe(FALLBACK_AMOUNT_SATS);
+    expect(updateArgs.data.txid).toBe(FALLBACK_TXID);
+  });
+
+  it('sums multiple vouts that pay the receiver address', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue({
+      result: {
+        tx: {
+          txid: FALLBACK_TXID,
+          hash: FALLBACK_TXID,
+          version: 2, size: 300, vsize: 300, weight: 1200, locktime: 0,
+          vin: [],
+          vout: [
+            { value: FALLBACK_AMOUNT_BTC, n: 0, scriptPubKey: { asm: '', desc: '', hex: 'aa', type: 'p2wpkh', address: ORIGINAL_ADDRESS } },
+            { value: FALLBACK_AMOUNT_BTC, n: 1, scriptPubKey: { asm: '', desc: '', hex: 'bb', type: 'p2wpkh', address: ORIGINAL_ADDRESS } },
+          ],
+        },
+      },
+      error: null,
+    });
+
+    await broadcastFallback(makeReceiveSess(), mockConfig as Config);
+
+    const updateArgs = db.receive.update.mock.calls[0][0];
+    expect(updateArgs.data.amount).toBe(FALLBACK_AMOUNT_SATS * 2n); // both vouts summed
+  });
+
+  it('records 0n when no vout pays the receiver address', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue({
+      result: {
+        tx: {
+          txid: FALLBACK_TXID,
+          hash: FALLBACK_TXID,
+          version: 2, size: 200, vsize: 200, weight: 800, locktime: 0,
+          vin: [],
+          vout: [
+            { value: 0.5, n: 0, scriptPubKey: { asm: '', desc: '', hex: 'cc', type: 'p2wpkh', address: 'bc1qsomethingelse' } },
+          ],
+        },
+      },
+      error: null,
+    });
+
+    await broadcastFallback(makeReceiveSess(), mockConfig as Config);
+
+    const updateArgs = db.receive.update.mock.calls[0][0];
+    expect(updateArgs.data.amount).toBe(0n);
   });
 
 });

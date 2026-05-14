@@ -43,6 +43,8 @@ jest.mock('../lib/Log2File', () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { cnClient } = require('../lib/globals');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { db } = require('../lib/db');
 
 const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE'> = {
   SEND_WALLET: '01',
@@ -101,20 +103,6 @@ beforeEach(() => jest.clearAllMocks());
 
 describe('validateAndBroadcastPayjoinPsbt — fee-rate guard', () => {
 
-  /**
-   * RED TEST — this test documents the security gap and is expected to FAIL
-   * until the fee-rate check is added.
-   *
-   * A receiver that uses an extremely high fee rate (e.g. 1 000 sat/vbyte when
-   * the original was ~10 sat/vbyte) would cause the sender to pay far more in
-   * fees than anticipated. The payjoin SDK allows this provided the absolute fee
-   * increase is proportional to the receiver's contributed inputs.  Our code
-   * currently has no second layer of defence: it signs and broadcasts the
-   * proposal before inspecting the fee.
-   *
-   * The test asserts what SHOULD happen (broadcast is refused).  It will fail
-   * in the current codebase, proving the gap exists.
-   */
   it('rejects proposal when fee rate exceeds MAX_PAYJOIN_FEE_RATE', async () => {
     // 1 000 sat/vbyte × 200 vbytes = 200 000 sats in fees on a 100 000 sat payment — 2× the payment amount
     setupMocks(1_000);
@@ -142,11 +130,6 @@ describe('validateAndBroadcastPayjoinPsbt — fee-rate guard', () => {
     );
   });
 
-  /**
-   * Verifies that fee inspection (decodePsbt) currently happens AFTER broadcast,
-   * not before.  This directly documents the ordering bug: the fee check is
-   * accounting-only, not a gate.
-   */
   it('decodes proposal PSBT before signing and broadcasts in correct order', async () => {
     setupMocks(10);
     const callOrder: string[] = [];
@@ -171,5 +154,113 @@ describe('validateAndBroadcastPayjoinPsbt — fee-rate guard', () => {
     await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
 
     expect(callOrder).toEqual(['decodePsbt', 'processPsbt', 'finalizePsbt', 'sendRawTransaction']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error paths — each step can abort the pipeline independently
+// ---------------------------------------------------------------------------
+
+describe('validateAndBroadcastPayjoinPsbt — error paths', () => {
+
+  it('returns early without signing when decodePsbt returns an error', async () => {
+    cnClient.decodePsbt.mockResolvedValue({ result: null, error: { code: -1, message: 'decode failed' } });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(cnClient.processPsbt).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('returns early without signing when decodePsbt returns null result', async () => {
+    cnClient.decodePsbt.mockResolvedValue({ result: null, error: null });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(cnClient.processPsbt).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('returns early without finalizing when processPsbt returns an error', async () => {
+    setupMocks(10);
+    cnClient.processPsbt.mockResolvedValue({ result: null, error: { code: -1, message: 'process failed' } });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(cnClient.finalizePsbt).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('returns early without finalizing when processPsbt returns complete=false', async () => {
+    setupMocks(10);
+    cnClient.processPsbt.mockResolvedValue({ result: { psbt: SIGNED_PSBT, complete: false }, error: null });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(cnClient.finalizePsbt).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('returns early without broadcasting when finalizePsbt returns an error', async () => {
+    setupMocks(10);
+    cnClient.finalizePsbt.mockResolvedValue({ result: null, error: { code: -1, message: 'finalize failed' } });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('returns early without broadcasting when finalizePsbt returns no hex', async () => {
+    setupMocks(10);
+    cnClient.finalizePsbt.mockResolvedValue({ result: { hex: null, psbt: SIGNED_PSBT }, error: null });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('does not update db when sendRawTransaction returns an error', async () => {
+    setupMocks(10);
+    cnClient.sendRawTransaction.mockResolvedValue({ result: null, error: { code: -26, message: 'insufficient fee' } });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Success path — db record updated with txid and accounting figures
+// ---------------------------------------------------------------------------
+
+describe('validateAndBroadcastPayjoinPsbt — success accounting', () => {
+
+  it('updates db.send with txid and fee after a successful broadcast', async () => {
+    // 10 sat/vbyte × 200 vbytes = 2 000 sats total fee (0.00002 BTC)
+    setupMocks(10);
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(db.send.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 1 },
+        data: expect.objectContaining({
+          txid: FAKE_TXID,
+          fee: 2_000n,      // extractFeeFromPsbt(0.00002 BTC)
+          senderFee: 0n,    // no owned addresses in mock → rawFee < 0 → clamped to 0
+          senderInAmount: 0n,
+          senderOutAmount: 0n,
+        }),
+      }),
+    );
+  });
+
+  it('does not update db when sendRawTransaction returns null txid', async () => {
+    setupMocks(10);
+    cnClient.sendRawTransaction.mockResolvedValue({ result: null, error: null });
+
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+
+    expect(db.send.update).not.toHaveBeenCalled();
   });
 });

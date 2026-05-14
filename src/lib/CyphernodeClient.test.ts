@@ -1,5 +1,8 @@
 import { CyphernodeClient } from "./CyphernodeClient";
 import { config } from "../config";
+import { isStubMode } from "./StubMode";
+
+const maybeTest = isStubMode() ? test.skip : test;
 
 describe("CyphernodeClient", () => {
   let client: CyphernodeClient;
@@ -23,7 +26,7 @@ describe("CyphernodeClient", () => {
     expect(typeof client._generateToken()).toBe("string");
   });
 
-  test("_post 401 Unauthorized", async () => {
+  maybeTest("_post 401 Unauthorized", async () => {
     // test calling an invalid endpoint with post
     // an error object with a status of 401 should be returned
 
@@ -48,7 +51,7 @@ describe("CyphernodeClient", () => {
     expect(result.status).toBe(403); // Shouldn't this actually get getting a 403?
   });
 
-  test("_post with no response", async () => {
+  maybeTest("_post with no response", async () => {
     const configCopy = { ...config, CN_URL: "http://fake:9999" };
     const clientCopy = new CyphernodeClient(configCopy);
 
@@ -60,7 +63,7 @@ describe("CyphernodeClient", () => {
     expect(result.status).toBe(-1);
   });
 
-  test("_get 401 Unauthorized", async () => {
+  maybeTest("_get 401 Unauthorized", async () => {
     // test calling an invalid endpoint with post
     // an error object with a status of 401 should be returned
 
@@ -85,7 +88,7 @@ describe("CyphernodeClient", () => {
     expect(result.status).toBe(403); // Shouldn't this actually get getting a 403?
   });
 
-  test("_get with no response", async () => {
+  maybeTest("_get with no response", async () => {
     const configCopy = { ...config, CN_URL: "http://fake:9999" };
     const clientCopy = new CyphernodeClient(configCopy);
 
@@ -415,7 +418,7 @@ describe("CyphernodeClient", () => {
     expect(typeof response.result?.txid).toBe("string");
   }, 30000);*/
 
-  test.only("should validate an address", async () => {
+  test("should validate an address", async () => {
     const response = await client.validateAddress("2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc");
 
     expect(response).toHaveProperty("result");

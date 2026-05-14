@@ -1,11 +1,38 @@
-name: Build Docker Image
+name: CI
 
 on:
   push:
     branches:
       - main
+      - dev
+  pull_request:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Rewrite SSH GitHub URLs to HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Install Yarn (required by uniffi-bindgen-react-native prepare script)
+        run: npm install -g yarn
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test
+        env:
+          STUB_MODE: 'true'
+
   build:
     runs-on: ubuntu-latest
 

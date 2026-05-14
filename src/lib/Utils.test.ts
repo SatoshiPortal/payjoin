@@ -35,10 +35,6 @@ describe('Utils.btcToSats — float rounding', () => {
     [1,          100_000_000n],
   ];
 
-  /**
-   * RED tests — these will FAIL with the current float-based implementation
-   * for the known problematic amounts, proving the bug exists.
-   */
   test.each(cases)('btcToSats(%s) === %s', (input, expected) => {
     expect(Utils.btcToSats(input)).toBe(expected);
   });

@@ -1,4 +1,6 @@
 import logger from "./Log2File";
+import { isStubMode } from "./StubMode";
+import { cyphernodeClientStub } from "../stubs/CyphernodeClient";
 import crypto from "crypto";
 import axios, { AxiosError, AxiosRequestConfig, AxiosResponse } from "axios";
 import https from "https";
@@ -125,6 +127,8 @@ class CyphernodeClient {
   ): Promise<any> {
     logger.info("CyphernodeClient._post:", this.baseURL, url, postdata, addedOptions);
 
+    if (isStubMode()) return cyphernodeClientStub("POST", url, postdata);
+
     let configs: AxiosRequestConfig = {
       url: url,
       method: "post",
@@ -188,6 +192,8 @@ class CyphernodeClient {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async _get(url: string, addedOptions?: unknown): Promise<any> {
     logger.info("CyphernodeClient._get:", url, addedOptions);
+
+    if (isStubMode()) return cyphernodeClientStub("GET", url, {});
 
     let configs: AxiosRequestConfig = {
       url: url,

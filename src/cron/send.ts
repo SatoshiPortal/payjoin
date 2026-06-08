@@ -7,6 +7,7 @@ import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { extractFeeFromPsbt, fetchBufferResponse, withRelayFallback } from "../lib/payjoin";
 import { SenderPersister } from "../lib/persister";
+import { AxiosError } from "axios";
 
 export async function restoreSendSessions(config: Config) {
   logger.info(restoreSendSessions, 'restoring send sessions');
@@ -71,7 +72,18 @@ export async function processSendSession(sendSess: Send, config: Config) {
 
         const sender = sessionState.inner.inner;
         const { request, ohttpCtx } = sender.createPollRequest(sendSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
-        const responseBuffer = await fetchBufferResponse(request);
+        let responseBuffer: ArrayBuffer;
+        try {
+          responseBuffer = await fetchBufferResponse(request);
+        } catch (e) {
+          // The directory long-polls (~30s) waiting for a payjoin proposal.
+          // Our client timeout fires first (ECONNABORTED). Treat as Stasis.
+          if (e instanceof AxiosError && e.code === 'ECONNABORTED') {
+            logger.info(processSendSession, `poll long-poll timed out — no payjoin proposal yet, retrying next cycle (session ${sendSess.id})`);
+            return;
+          }
+          throw e;
+        }
         const outcome = sender.processResponse(responseBuffer, ohttpCtx).save(persister);
 
         if (payjoin.PollingForProposalTransitionOutcome.Stasis.instanceOf(outcome)) {
@@ -175,22 +187,41 @@ export async function validateAndBroadcastPayjoinPsbt(
   const totalFee = extractFeeFromPsbt(decodedProposal);
   logger.debug(validateAndBroadcastPayjoinPsbt, 'total fee:', totalFee);
 
-  const senderTotalInputAmount = decodedProposal.inputs
-    .filter((input) =>
-      input.witness_utxo &&
-      input.witness_utxo.scriptPubKey.address &&
-      isAddressOwned(input.witness_utxo.scriptPubKey.address, config)
-    )
-    .reduce((acc, input) => acc + Utils.btcToSats(input.witness_utxo?.amount || 0), 0n);
+  const txInputs = decodedProposal.inputs.map((input) => {
+    const address = input.witness_utxo?.scriptPubKey?.address ?? null;
+    const amount = Utils.btcToSats(input.witness_utxo?.amount || 0);
+    const ownedBy: 'sender' | 'receiver' | null =
+      address ? (isAddressOwned(address, config) ? 'sender' : 'receiver') : null;
+    return { address, amount: amount.toString(), ownedBy };
+  });
+
+  const txOutputs = decodedProposal.tx.vout.map((output) => {
+    const address = output.scriptPubKey?.address ?? null;
+    const amount = Utils.btcToSats(output.value || 0);
+    const ownedBy: 'sender' | 'receiver' | null =
+      address ? (isAddressOwned(address, config) ? 'sender' : 'receiver') : null;
+    return { address, amount: amount.toString(), ownedBy };
+  });
+
+  const senderTotalInputAmount = txInputs
+    .filter(i => i.ownedBy === 'sender')
+    .reduce((acc, i) => acc + BigInt(i.amount), 0n);
   logger.debug(validateAndBroadcastPayjoinPsbt, 'total sender input amount:', senderTotalInputAmount);
 
-  const senderTotalOutputAmount = decodedProposal.tx.vout
-    .filter((output) =>
-      output.scriptPubKey.address &&
-      isAddressOwned(output.scriptPubKey.address, config)
-    )
-    .reduce((acc, output) => acc + Utils.btcToSats(output.value || 0), 0n);
+  const senderTotalOutputAmount = txOutputs
+    .filter(o => o.ownedBy === 'sender')
+    .reduce((acc, o) => acc + BigInt(o.amount), 0n);
   logger.debug(validateAndBroadcastPayjoinPsbt, 'total sender output amount:', senderTotalOutputAmount);
+
+  const receiverTotalInputAmount = txInputs
+    .filter(i => i.ownedBy === 'receiver')
+    .reduce((acc, i) => acc + BigInt(i.amount), 0n);
+  logger.debug(validateAndBroadcastPayjoinPsbt, 'total receiver input amount:', receiverTotalInputAmount);
+
+  const receiverTotalOutputAmount = txOutputs
+    .filter(o => o.ownedBy === 'receiver')
+    .reduce((acc, o) => acc + BigInt(o.amount), 0n);
+  logger.debug(validateAndBroadcastPayjoinPsbt, 'total receiver output amount:', receiverTotalOutputAmount);
 
   const rawFee = senderTotalInputAmount - senderTotalOutputAmount - sendSess.amount;
   const senderFee = rawFee >= 0n ? rawFee : 0n;
@@ -208,6 +239,10 @@ export async function validateAndBroadcastPayjoinPsbt(
         senderFee,
         senderInAmount: senderTotalInputAmount,
         senderOutAmount: senderTotalOutputAmount,
+        receiverInAmount: receiverTotalInputAmount,
+        receiverOutAmount: receiverTotalOutputAmount,
+        txInputs,
+        txOutputs,
       },
     });
     logger.info(validateAndBroadcastPayjoinPsbt, 'updated session with txid:', sendResult, updateResult);

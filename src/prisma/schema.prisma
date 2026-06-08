@@ -19,6 +19,10 @@ model Send {
   amount            BigInt
   senderInAmount    BigInt?       @map("sender_input_amount")
   senderOutAmount   BigInt?       @map("sender_output_amount")
+  receiverInAmount  BigInt?       @map("receiver_input_amount")
+  receiverOutAmount BigInt?       @map("receiver_output_amount")
+  txInputs          Json?         @map("tx_inputs")
+  txOutputs         Json?         @map("tx_outputs")
   txid              String?
   address           String?
   fee               BigInt?
@@ -47,6 +51,10 @@ model Receive {
   amount              BigInt
   receiverInAmount    BigInt?       @map("receiver_input_amount")
   receiverOutAmount   BigInt?       @map("receiver_output_amount")
+  senderInAmount      BigInt?       @map("sender_input_amount")
+  senderOutAmount     BigInt?       @map("sender_output_amount")
+  txInputs            Json?         @map("tx_inputs")
+  txOutputs           Json?         @map("tx_outputs")
   txid                String?
   fee                 BigInt?
   receiverFee         BigInt?       @map("receiver_fee")

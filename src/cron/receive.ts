@@ -367,20 +367,43 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
         logger.debug(processReceiveSession, 'total fee:', totalFee);
 
-        receiverTotalInputAmount = sumReceiverInputs(
-          decodedFinalPsbtResult.inputs,
-          decodedFinalPsbtResult.tx.vin,
-          inputs,
-        );
+        const txInputs = decodedFinalPsbtResult.inputs.map((input, index) => {
+          const address = input.witness_utxo?.scriptPubKey?.address ?? null;
+          const amount = Utils.btcToSats(input.witness_utxo?.amount || 0);
+          const outpoint = decodedFinalPsbtResult.tx.vin[index];
+          const ownedBy: 'sender' | 'receiver' = outpoint != null && inputs.some(
+            (c) => c.txid === outpoint.txid && Number(c.vout) === outpoint.vout
+          ) ? 'receiver' : 'sender';
+          return { address, amount: amount.toString(), ownedBy };
+        });
+
+        const txOutputs = decodedFinalPsbtResult.tx.vout.map((output) => {
+          const address = output.scriptPubKey?.address ?? null;
+          const amount = Utils.btcToSats(output.value || 0);
+          const ownedBy: 'sender' | 'receiver' | null =
+            address === effectiveReceiverAddress ? 'receiver' : address != null ? 'sender' : null;
+          return { address, amount: amount.toString(), ownedBy };
+        });
+
+        receiverTotalInputAmount = txInputs
+          .filter(i => i.ownedBy === 'receiver')
+          .reduce((acc, i) => acc + BigInt(i.amount), 0n);
         logger.debug(processReceiveSession, 'total receiver input amount:', receiverTotalInputAmount);
 
-        receiverTotalOutputAmount = decodedFinalPsbtResult.tx.vout.reduce((acc, output) => {
-          if (output.scriptPubKey.address === effectiveReceiverAddress) {
-            return acc + Utils.btcToSats(output.value);
-          }
-          return acc;
-        }, 0n);
+        receiverTotalOutputAmount = txOutputs
+          .filter(o => o.ownedBy === 'receiver')
+          .reduce((acc, o) => acc + BigInt(o.amount), 0n);
         logger.debug(processReceiveSession, 'total receiver output amount:', receiverTotalOutputAmount);
+
+        const senderTotalInputAmount = txInputs
+          .filter(i => i.ownedBy === 'sender')
+          .reduce((acc, i) => acc + BigInt(i.amount), 0n);
+        logger.debug(processReceiveSession, 'total sender input amount:', senderTotalInputAmount);
+
+        const senderTotalOutputAmount = txOutputs
+          .filter(o => o.ownedBy === 'sender')
+          .reduce((acc, o) => acc + BigInt(o.amount), 0n);
+        logger.debug(processReceiveSession, 'total sender output amount:', senderTotalOutputAmount);
 
         const netReceived = receiverTotalOutputAmount - receiverTotalInputAmount;
 
@@ -405,12 +428,16 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           }
         }
 
-        // fee absorbed by receiver = what sender actually paid minus what receiver netted
-        receiverFee = senderPaymentAmount - netReceived;
+        // receiver_fee = the portion of the total fee absorbed by the receiver (their input's
+        // extra weight cost, deducted from their output by the payjoin library). Clamped at 0
+        // in case senderPaymentAmount is unknown (0n) or netReceived somehow exceeds it.
+        const rawReceiverFee = senderPaymentAmount - netReceived;
+        receiverFee = rawReceiverFee > 0n ? rawReceiverFee : 0n;
         logger.debug(processReceiveSession, 'receiver fee:', receiverFee, 'sender payment:', senderPaymentAmount, 'net received:', netReceived);
 
-        // if the sender paid a different amount, record what was actually received
-        const calculatedAmount = netReceived;
+        // amount = what the sender actually paid = netReceived + receiver's fee contribution.
+        // This recovers the full payment amount rather than the reduced net-of-fee figure.
+        const calculatedAmount = netReceived + receiverFee;
         let updateAmount = receiveSess.amount;
         const tolerance = 10n;
         const difference = calculatedAmount > receiveSess.amount
@@ -474,6 +501,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
               receiverFee,
               receiverInAmount: receiverTotalInputAmount,
               receiverOutAmount: receiverTotalOutputAmount,
+              senderInAmount: senderTotalInputAmount,
+              senderOutAmount: senderTotalOutputAmount,
+              txInputs,
+              txOutputs,
             }
           });
           logger.info(processReceiveSession, 'updated session with txid:', txid, receiveSess.id, updateResult);
@@ -624,9 +655,9 @@ async function availableInputs(config: Config): Promise<InputPairWithMetadata[]>
 
   logger.debug(availableInputs, 'found utxos:', utxosResult.utxos.length);
 
-  // sort smallest to largest
+  // sort smallest to largest, excluding 0-value UTXOs (e.g. late-period regtest coinbases after subsidy halves to 0)
   const sortedUtxos = [...utxosResult.utxos]
-    .filter((utxo) => utxo.confirmations > 0)
+    .filter((utxo) => utxo.confirmations > 0 && Utils.btcToSats(utxo.amount) > 0n)
     .sort((a, b) => {
       return Number(Utils.btcToSats(a.amount) - Utils.btcToSats(b.amount))
     });

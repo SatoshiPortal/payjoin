@@ -54,10 +54,9 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
               receiverOutAmount: 0n,
               txid: data.txid,
               nonPayjoinTs: new Date(),
-              cancelledTs: new Date(), // cancel it so we don't process the payjoin
             }
           });
-          logger.info(handleAddressCallback, "cancelled receive session");
+          logger.info(handleAddressCallback, "non-payjoin tx received for session");
         }
 
         // send the callback data

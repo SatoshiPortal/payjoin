@@ -90,6 +90,63 @@ export function arrayBufferToHex(buffer: ArrayBuffer): string {
     return hexCodes.join('');
 }
 
+/**
+ * Extract a useful, human-readable message from an error thrown by the payjoin
+ * WASM/FFI bindings.
+ *
+ * The uniffi-generated tagged-enum errors (e.g. `ReceiverPersistedError`) set
+ * `message` to just the variant name — "ReceiverPersistedError.Storage" — which
+ * tells us nothing about what actually went wrong. The real detail lives in the
+ * `inner` array, which holds opaque WASM error objects (e.g. `ImplementationError`)
+ * that JSON-serialize to `{}` but expose the underlying Rust `Display`/`Debug`
+ * strings via `toString()` / `toDebugString()`.
+ *
+ * Note: due to an upstream payjoin-ffi quirk (`impl_save_for_transition!` wraps the
+ * whole `PersistedError` in an `ImplementationError`), genuine protocol/API errors —
+ * such as a `check_broadcast_suitability` rejection — also surface under the
+ * `Storage` tag. Reading the inner `Display` string is what recovers the real reason
+ * (e.g. "Fatal error: ... PSBT rejected by mempool").
+ */
+export function describePayjoinError(e: unknown): string {
+  // uniffi tagged-enum error: prefer the inner WASM error detail over the bare variant name.
+  if (e && typeof e === 'object' && 'tag' in e) {
+    const tag = String((e as { tag: unknown }).tag);
+    const rawInner = (e as { inner?: unknown }).inner;
+    const items = Array.isArray(rawInner) ? rawInner : rawInner != null ? [rawInner] : [];
+    const detail = items.map(stringifyWasmError).filter(Boolean).join('; ');
+    const name = e instanceof Error && e.name ? e.name : 'PayjoinError';
+    return detail ? `${name}.${tag}: ${detail}` : `${name}.${tag}`;
+  }
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+function stringifyWasmError(item: unknown): string {
+  if (item == null) return '';
+  if (typeof item === 'string') return item;
+  if (typeof item !== 'object') return String(item);
+
+  const obj = item as { toDebugString?: () => string; toString?: () => string };
+  // toDebugString() -> Rust Debug (most detail); toString() -> Rust Display.
+  try {
+    if (typeof obj.toDebugString === 'function') {
+      const s = obj.toDebugString();
+      if (s) return s;
+    }
+  } catch { /* WASM handle may be unavailable — fall through */ }
+  try {
+    if (typeof obj.toString === 'function' && obj.toString !== Object.prototype.toString) {
+      const s = obj.toString();
+      if (s && s !== '[object Object]') return s;
+    }
+  } catch { /* fall through */ }
+  try {
+    const j = JSON.stringify(item);
+    if (j && j !== '{}') return j;
+  } catch { /* ignore */ }
+  return '';
+}
+
 export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string; ohttpRelay: string }> {
   logger.info(createReceiver, `Creating receiver for address: ${address} amount: ${amount}`);
 

@@ -6,7 +6,7 @@ import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse, recordRelayFailure } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, fetchBufferResponse, recordRelayFailure } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 
@@ -522,7 +522,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         where: { id: receiveSess.id, failedTs: null },
         data: {
           failedTs: new Date(),
-          failedReason: `exception: ${e instanceof Error ? e.message : String(e)}`,
+          failedReason: `exception: ${describePayjoinError(e)}`,
         }
       }).catch((e) => {
         logger.error(processReceiveSession, 'failed to update session with failed timestamp:', e);

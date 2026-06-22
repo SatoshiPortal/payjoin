@@ -33,7 +33,7 @@ jest.mock('./persister', () => ({
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
-import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry } from './payjoin';
+import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError } from './payjoin';
 import { ReceiveStatus, SendStatus } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
 
@@ -321,5 +321,54 @@ describe('extractExpiry', () => {
 
   it('extracts timestamp when EX1 appears among dash-separated hash parts', () => {
     expect(extractExpiry('https://example.com/pj#PARAM1-EX1qqqsqqq-PARAM2')).toBe(256);
+  });
+});
+
+describe('describePayjoinError', () => {
+  it('returns message for a plain Error', () => {
+    expect(describePayjoinError(new Error('boom'))).toBe('boom');
+  });
+
+  it('stringifies a non-error value', () => {
+    expect(describePayjoinError('just a string')).toBe('just a string');
+    expect(describePayjoinError(42)).toBe('42');
+  });
+
+  it('extracts the inner WASM detail from a tagged uniffi error via toDebugString', () => {
+    // Mirrors the ReceiverPersistedError.Storage shape thrown by the bindings:
+    // `message` is just the variant name; the real detail lives in `inner`,
+    // an opaque WASM object that JSON-serializes to {} but exposes toDebugString().
+    const innerWasm = {
+      toDebugString: () => 'Fatal error: Can\'t broadcast. PSBT rejected by mempool.',
+      toString: () => 'Fatal error: Can\'t broadcast. PSBT rejected by mempool.',
+    };
+    const err = Object.assign(new Error('ReceiverPersistedError.Storage'), {
+      name: 'ReceiverPersistedError',
+      tag: 'Storage',
+      inner: [innerWasm],
+    });
+    expect(describePayjoinError(err)).toBe(
+      "ReceiverPersistedError.Storage: Fatal error: Can't broadcast. PSBT rejected by mempool."
+    );
+  });
+
+  it('falls back to toString when toDebugString is absent', () => {
+    const err = Object.assign(new Error('ReceiverPersistedError.Receiver'), {
+      name: 'ReceiverPersistedError',
+      tag: 'Receiver',
+      inner: [{ toString: () => 'protocol: original psbt rejected' }],
+    });
+    expect(describePayjoinError(err)).toBe(
+      'ReceiverPersistedError.Receiver: protocol: original psbt rejected'
+    );
+  });
+
+  it('returns just name.tag when the inner detail is an opaque {} handle', () => {
+    const err = Object.assign(new Error('ReceiverPersistedError.Storage'), {
+      name: 'ReceiverPersistedError',
+      tag: 'Storage',
+      inner: [{}],
+    });
+    expect(describePayjoinError(err)).toBe('ReceiverPersistedError.Storage');
   });
 });

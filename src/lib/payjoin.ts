@@ -147,6 +147,39 @@ function stringifyWasmError(item: unknown): string {
   return '';
 }
 
+/**
+ * Extract the actual protocol error from a persisted receiver session log.
+ *
+ * When a receiver check rejects the original payload (e.g. broadcast suitability), the SDK
+ * appends a `GotReplyableError` event before moving to the `HasReplyableError` state. That
+ * event is the authoritative reason — far more useful than the generic
+ * `ReceiverPersistedError` that surfaces through the throw path, and the `HasReplyableError`
+ * state object exposes no getter for it.
+ *
+ * Events are stored as a JSON array of JSON-encoded event strings, each shaped like
+ * `{"GotReplyableError":{"error_code":"...","message":"...","extra":{}}}`. Returns the most
+ * recent one formatted as "error_code: message", or undefined if none is present.
+ */
+export function extractReplyableError(sessionJson: string | null | undefined): string | undefined {
+  if (!sessionJson) return undefined;
+  let events: unknown;
+  try { events = JSON.parse(sessionJson); } catch { return undefined; }
+  if (!Array.isArray(events)) return undefined;
+
+  let reason: string | undefined;
+  for (const ev of events) {
+    let parsed: unknown;
+    try { parsed = typeof ev === 'string' ? JSON.parse(ev) : ev; } catch { continue; }
+    const err = (parsed as { GotReplyableError?: { error_code?: string; message?: string } })?.GotReplyableError;
+    if (err) {
+      reason = err.message
+        ? (err.error_code ? `${err.error_code}: ${err.message}` : err.message)
+        : err.error_code;
+    }
+  }
+  return reason;
+}
+
 export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string; ohttpRelay: string }> {
   logger.info(createReceiver, `Creating receiver for address: ${address} amount: ${amount}`);
 

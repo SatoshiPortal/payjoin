@@ -6,7 +6,7 @@ import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, fetchBufferResponse, recordRelayFailure } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, recordRelayFailure } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 
@@ -94,6 +94,56 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       let receiver: any = restoredReceiver.inner.inner;
 
       logger.debug(processReceiveSession, 'restored receiver state:', restoredReceiver.tag);
+
+      // Terminal state — the session has already been closed (payjoin completed, or the
+      // error reply below ran). The on-chain outcome is tracked by the address watch
+      // callback and broadcastFallback(); re-running the flow would only waste a cron
+      // cycle, so skip. (Closed carries an outcome object, not a receiver state.)
+      if (restoredReceiver.tag === 'Closed') {
+        logger.info(processReceiveSession, 'Receiver session is Closed — skipping');
+        return;
+      }
+
+      // A prior pass recorded a replyable error (e.g. the original PSBT was rejected as
+      // un-broadcastable). The protocol expects us to return that error to the sender so
+      // it stops waiting and broadcasts its own fallback. Deliver the error response, which
+      // also transitions the session to its terminal Closed state so it isn't replayed
+      // every cycle. The fallback tx itself is broadcast separately by broadcastFallback()
+      // using the stored fallbackTxHex.
+      if (receiver instanceof payjoin.HasReplyableError) {
+        logger.info(processReceiveSession, 'Receiver is in HasReplyableError state — returning error response to sender');
+
+        const errReq = receiver.createErrorRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        let errResponseBuffer: ArrayBuffer;
+        try {
+          errResponseBuffer = await fetchBufferResponse(errReq.request);
+        } catch (e) {
+          // Same long-poll/timeout semantics as the proposal poll: a transient relay
+          // timeout isn't a hard failure — retry on the next cron cycle.
+          if (e instanceof AxiosError && e.code === 'ECONNABORTED') {
+            logger.info(processReceiveSession, `error-reply post timed out — retrying next cycle (session ${receiveSess.id})`);
+            return;
+          }
+          throw e;
+        }
+
+        // save() persists the response acknowledgement and closes the session.
+        receiver.processErrorResponse(errResponseBuffer, errReq.clientResponse).save(persister);
+        await persister.flush();
+        logger.info(processReceiveSession, 'error response delivered to sender; session closed');
+
+        // Record the actual protocol error pulled from the persisted GotReplyableError event
+        // (e.g. "OriginalPsbtRejected: Can't broadcast. PSBT rejected by mempool.") rather
+        // than a generic string. Preserve any existing failedTs so broadcastFallback's
+        // timer isn't reset.
+        const failedReason = extractReplyableError(receiveSess.session) ?? 'payjoin rejected by receiver';
+        await db.receive.update({
+          where: { id: receiveSess.id },
+          data: { failedReason, failedTs: receiveSess.failedTs ?? new Date() },
+        }).catch((err) => logger.error(processReceiveSession, 'failed to record HasReplyableError reason:', err));
+
+        return;
+      }
 
       if (receiver instanceof payjoin.Initialized) {
         logger.debug(processReceiveSession, 'Receiver is in Initialized state');

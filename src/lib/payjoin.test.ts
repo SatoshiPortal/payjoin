@@ -33,7 +33,7 @@ jest.mock('./persister', () => ({
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
-import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError } from './payjoin';
+import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError } from './payjoin';
 import { ReceiveStatus, SendStatus } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
 
@@ -370,5 +370,50 @@ describe('describePayjoinError', () => {
       inner: [{}],
     });
     expect(describePayjoinError(err)).toBe('ReceiverPersistedError.Storage');
+  });
+});
+
+describe('extractReplyableError', () => {
+  // Session events are stored as an array of JSON-encoded strings.
+  const ev = (o: unknown) => JSON.stringify(o);
+
+  it('returns undefined for null/empty/invalid input', () => {
+    expect(extractReplyableError(null)).toBeUndefined();
+    expect(extractReplyableError(undefined)).toBeUndefined();
+    expect(extractReplyableError('')).toBeUndefined();
+    expect(extractReplyableError('not json')).toBeUndefined();
+    expect(extractReplyableError('{"not":"an array"}')).toBeUndefined();
+  });
+
+  it('returns undefined when no GotReplyableError event is present', () => {
+    const session = JSON.stringify([ev({ Created: {} }), ev({ RetrievedOriginalPayload: {} })]);
+    expect(extractReplyableError(session)).toBeUndefined();
+  });
+
+  it('extracts error_code and message from a GotReplyableError event', () => {
+    const session = JSON.stringify([
+      ev({ Created: {} }),
+      ev({ GotReplyableError: { error_code: 'OriginalPsbtRejected', message: "Can't broadcast. PSBT rejected by mempool.", extra: {} } }),
+      ev({ Closed: 'Failure' }),
+    ]);
+    expect(extractReplyableError(session)).toBe("OriginalPsbtRejected: Can't broadcast. PSBT rejected by mempool.");
+  });
+
+  it('returns the most recent GotReplyableError when several are present', () => {
+    const session = JSON.stringify([
+      ev({ GotReplyableError: { error_code: 'First', message: 'first error' } }),
+      ev({ GotReplyableError: { error_code: 'Second', message: 'second error' } }),
+    ]);
+    expect(extractReplyableError(session)).toBe('Second: second error');
+  });
+
+  it('falls back to message alone or error_code alone', () => {
+    expect(extractReplyableError(JSON.stringify([JSON.stringify({ GotReplyableError: { message: 'only message' } })]))).toBe('only message');
+    expect(extractReplyableError(JSON.stringify([JSON.stringify({ GotReplyableError: { error_code: 'OnlyCode' } })]))).toBe('OnlyCode');
+  });
+
+  it('tolerates already-parsed object events', () => {
+    const session = JSON.stringify([{ GotReplyableError: { error_code: 'C', message: 'm' } }]);
+    expect(extractReplyableError(session)).toBe('C: m');
   });
 });

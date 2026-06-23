@@ -6,7 +6,7 @@ import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, recordRelayFailure } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, randomRelay, recordRelayFailure } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 
@@ -113,7 +113,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.HasReplyableError) {
         logger.info(processReceiveSession, 'Receiver is in HasReplyableError state — returning error response to sender');
 
-        const errReq = receiver.createErrorRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        const errReq = receiver.createErrorRequest(receiveSess.ohttpRelay ?? randomRelay());
         let errResponseBuffer: ArrayBuffer;
         try {
           errResponseBuffer = await fetchBufferResponse(errReq.request);
@@ -148,10 +148,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.Initialized) {
         logger.debug(processReceiveSession, 'Receiver is in Initialized state');
 
-        const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? randomRelay());
         let responseBuffer: ArrayBuffer;
         try {
-          responseBuffer = await fetchBufferResponse(rr.request);
+          responseBuffer = await fetchBufferResponse(rr.request, config.OHTTP_LONGPOLL_TIMEOUT_MS);
         } catch (e) {
           // The directory uses a long-poll (~30s) waiting for a sender's proposal.
           // Our client timeout fires first, producing ECONNABORTED. This is not a
@@ -533,7 +533,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         // flush persisted state before sending the proposal so a crash after send can replay correctly
         await persister.flush();
 
-        const rr = receiver.createPostRequest(receiveSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        const rr = receiver.createPostRequest(receiveSess.ohttpRelay ?? randomRelay());
         const responseBuffer = await fetchBufferResponse(rr.request);
 
         // Note: a success response here doesn't mean the sender accepted the PSBT.

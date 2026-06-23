@@ -5,7 +5,7 @@ import { Config } from "../config";
 import { Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { extractFeeFromPsbt, fetchBufferResponse, withRelayFallback } from "../lib/payjoin";
+import { extractFeeFromPsbt, fetchBufferResponse, randomRelay, withRelayFallback } from "../lib/payjoin";
 import { SenderPersister } from "../lib/persister";
 import { AxiosError } from "axios";
 
@@ -71,10 +71,10 @@ export async function processSendSession(sendSess: Send, config: Config) {
         logger.debug(processSendSession, 'Sender is in PollingForProposal state — polling for proposal');
 
         const sender = sessionState.inner.inner;
-        const { request, ohttpCtx } = sender.createPollRequest(sendSess.ohttpRelay ?? config.OHTTP_RELAYS[0]);
+        const { request, ohttpCtx } = sender.createPollRequest(sendSess.ohttpRelay ?? randomRelay());
         let responseBuffer: ArrayBuffer;
         try {
-          responseBuffer = await fetchBufferResponse(request);
+          responseBuffer = await fetchBufferResponse(request, config.OHTTP_LONGPOLL_TIMEOUT_MS);
         } catch (e) {
           // The directory long-polls (~30s) waiting for a payjoin proposal.
           // Our client timeout fires first (ECONNABORTED). Treat as Stasis.

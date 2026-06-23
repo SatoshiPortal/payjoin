@@ -7,15 +7,16 @@ import Utils from '../lib/Utils';
 import { isShuttingDown, trackTask } from '../lib/gracefulShutdownRefs';
 
 const lockName = "sessions";
-let activeInterval: NodeJS.Timeout | null = null;
+const CRON_JITTER_RATIO = 0.3; // add up to +30% random delay per tick so polling isn't a fixed-period beacon
+let activeTimeout: NodeJS.Timeout | null = null;
 
 export function startCron(config: Config) {
   if (isShuttingDown()) return;
 
-  if (activeInterval) {
+  if (activeTimeout) {
     logger.info(startCron, "Stopping previous interval");
-    clearInterval(activeInterval);
-    activeInterval = null;
+    clearTimeout(activeTimeout);
+    activeTimeout = null;
   }
 
   const interval = config.CRON_INTERVAL; // in seconds
@@ -44,13 +45,22 @@ export function startCron(config: Config) {
     });
   };
 
-  activeInterval = setInterval(() => runJob(config), interval * 1000);
-  logger.info(startCron, `Started interval every ${interval} seconds`);
+  const scheduleNext = () => {
+    if (isShuttingDown()) return;
+    const jitterMs = Math.floor(Math.random() * interval * 1000 * CRON_JITTER_RATIO);
+    activeTimeout = setTimeout(async () => {
+      await runJob(config);
+      scheduleNext();
+    }, interval * 1000 + jitterMs);
+  };
+
+  scheduleNext();
+  logger.info(startCron, `Started interval every ${interval}s (+up to ${Math.round(interval * CRON_JITTER_RATIO)}s jitter)`);
 }
 
 export function stopCron() {
-  if (activeInterval) {
-    clearInterval(activeInterval);
-    activeInterval = null;
+  if (activeTimeout) {
+    clearTimeout(activeTimeout);
+    activeTimeout = null;
   }
 }

@@ -28,9 +28,24 @@ function relayIsAvailable(relay: string): boolean {
   return Date.now() - lastFailure > RELAY_FAILURE_COOLDOWN_MS;
 }
 
+/** Fisher-Yates shuffle (returns a new array) — randomizes initial relay choice to avoid a deterministic fingerprint. */
+function shuffled<T>(arr: readonly T[]): T[] {
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/** Pick a random relay — used as a fallback when a session has no pinned relay yet. */
+export function randomRelay(): string {
+  return config.OHTTP_RELAYS[Math.floor(Math.random() * config.OHTTP_RELAYS.length)];
+}
+
 export async function withRelayFallback<T>(fn: (relay: string) => Promise<T>): Promise<{ result: T; relay: string }> {
-  // Try healthy relays first, recently-failed ones as last resort
-  const sortedRelays = [...config.OHTTP_RELAYS].sort((a, b) => {
+  // Randomize order, then float recently-failed relays to the back (stable sort preserves the shuffle within each bucket).
+  const sortedRelays = shuffled(config.OHTTP_RELAYS).sort((a, b) => {
     return (relayIsAvailable(a) ? 0 : 1) - (relayIsAvailable(b) ? 0 : 1);
   });
   let lastError: unknown;
@@ -75,11 +90,11 @@ export async function getOhttpKeys() {
   return { keys: payjoin.OhttpKeys.decode(ohttpKeysBuffer.buffer as ArrayBuffer), relay };
 }
 
-export async function fetchBufferResponse(request: { url: string, contentType: string, body: any }): Promise<ArrayBuffer> {
+export async function fetchBufferResponse(request: { url: string, contentType: string, body: any }, timeoutMs: number = config.OHTTP_RELAY_TIMEOUT_MS): Promise<ArrayBuffer> {
     const axiosResponse = await axios.post(request.url, request.body, {
         headers: { "Content-Type": request.contentType },
         responseType: 'arraybuffer',
-        timeout: config.OHTTP_RELAY_TIMEOUT_MS,
+        timeout: timeoutMs,
     });
     return axiosResponse.data;
 }

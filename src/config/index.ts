@@ -15,7 +15,8 @@ export interface Config {
   PAYJOIN_DIRECTORY: string; // the directory server where the payjoin data is stored
   PAYJOIN_RECEIVE_EXPIRY: bigint; // the number of seconds before a payjoin request expires
   OHTTP_RELAYS: string[]; // ordered list of ohttp relay URLs to try in sequence
-  OHTTP_RELAY_TIMEOUT_MS: number; // per-relay timeout in milliseconds when attempting fallback
+  OHTTP_RELAY_TIMEOUT_MS: number; // per-relay timeout in milliseconds for quick requests (key fetch, proposal post)
+  OHTTP_LONGPOLL_TIMEOUT_MS: number; // timeout for directory long-poll requests; should exceed the directory's ~30s long-poll window
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
   MAX_PAYJOIN_FEE_RATE: number; // sat/vbyte — reject payjoin proposals whose fee rate exceeds this ceiling
 }
@@ -32,8 +33,9 @@ export let config: Config = {
   RECEIVE_WALLET: process.env.RECEIVE_WALLET || "01",
   PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",
   PAYJOIN_RECEIVE_EXPIRY: BigInt(process.env.PAYJOIN_RECEIVE_EXPIRY  || 300), // 5 minutes - to be inline roughly with the order expiry
-  OHTTP_RELAYS: process.env.OHTTP_RELAYS ? process.env.OHTTP_RELAYS.split(',').map(s => s.trim()) : ["https://ohttp.cakewallet.com", "https://pj.benalleng.com", "https://pj.bobspacebkk.com"],
+  OHTTP_RELAYS: process.env.OHTTP_RELAYS ? process.env.OHTTP_RELAYS.split(',').map(s => s.trim()) : ["https://ohttp.cakewallet.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"],
   OHTTP_RELAY_TIMEOUT_MS: Number(process.env.OHTTP_RELAY_TIMEOUT_MS || 10000),
+  OHTTP_LONGPOLL_TIMEOUT_MS: Number(process.env.OHTTP_LONGPOLL_TIMEOUT_MS || 35000),
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
   MAX_PAYJOIN_FEE_RATE: Number(process.env.MAX_PAYJOIN_FEE_RATE || 500), // 500 sat/vbyte default
 };

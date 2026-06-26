@@ -301,7 +301,8 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug(processReceiveSession, 'Receiver is in WantsOutputs state');
 
         if (config.OUTPUT_SUBSTITUTION_ENABLED && receiver.outputSubstitution() === payjoin.OutputSubstitution.Enabled) {
-          const { error: addrError, result: addrResult } = await cnClient.getnewaddress({ wallet: config.RECEIVE_WALLET });
+          // explicit bech32 to match the mobile wallet's bip84 default.
+          const { error: addrError, result: addrResult } = await cnClient.getnewaddress({ addressType: "bech32", wallet: config.RECEIVE_WALLET });
           if (!addrError && addrResult?.address) {
             try {
               const { error: addrInfoError, result: addrInfoResult } = await cnClient.getAddressInfo({ address: addrResult.address, wallet: config.RECEIVE_WALLET });
@@ -336,7 +337,8 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       }
 
       // get appropriate inputs to contribute - these are outside the WantsInputs block as we use them later also
-      const inputs = await availableInputs(config);
+      // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
+      const inputs = await availableInputs(config, receiveSess.amount);
       logger.debug(processReceiveSession, 'selected inputs:', inputs);
 
       if (receiver instanceof payjoin.WantsInputs) {
@@ -562,7 +564,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       }
 
     } catch (e) {
-      logger.error(processReceiveSession, 'failed to restore session:', e);
+      logger.error(processReceiveSession, 'failed to restore session:', describePayjoinError(e));
 
       if (e instanceof AxiosError && e.code === 'ECONNABORTED' && receiveSess.ohttpRelay) {
         recordRelayFailure(receiveSess.ohttpRelay);
@@ -696,7 +698,7 @@ async function saveKnownInputs(bip21: string, newInputs: Set<string>) {
   }
 }
 
-async function availableInputs(config: Config): Promise<InputPairWithMetadata[]> {
+async function availableInputs(config: Config, targetSats: bigint): Promise<InputPairWithMetadata[]> {
   const { error: utxosError, result: utxosResult } = await cnClient.listUnspent({ wallet: config.RECEIVE_WALLET });
   if (utxosError || !utxosResult) {
     logger.error(availableInputs, 'failed to list unspent:', utxosError);
@@ -705,11 +707,23 @@ async function availableInputs(config: Config): Promise<InputPairWithMetadata[]>
 
   logger.debug(availableInputs, 'found utxos:', utxosResult.utxos.length);
 
-  // sort smallest to largest, excluding 0-value UTXOs (e.g. late-period regtest coinbases after subsidy halves to 0)
+  // Order candidates by how close their value is to the payment amount, closest first.
+  //
+  // The PDK's tryPreservingPrivacy() returns the FIRST candidate that avoids the
+  // Unnecessary-Input Heuristic (UIH2), so the order we hand it decides which UTXO is
+  // contributed.
+  //
+  // Targeting the payment amount makes the contributed input look like a natural,
+  // wallet-selected coin (a single-input payment normally spends a coin in the ballpark
+  // of payment + fee + change), so amount-magnitude clustering can't single it out as the
+  // receiver's.
+  const abs = (n: bigint): bigint => (n < 0n ? -n : n);
   const sortedUtxos = [...utxosResult.utxos]
     .filter((utxo) => utxo.confirmations > 0 && Utils.btcToSats(utxo.amount) > 0n)
     .sort((a, b) => {
-      return Number(Utils.btcToSats(a.amount) - Utils.btcToSats(b.amount))
+      const da = abs(Utils.btcToSats(a.amount) - targetSats);
+      const db = abs(Utils.btcToSats(b.amount) - targetSats);
+      return da < db ? -1 : da > db ? 1 : 0;
     });
   logger.debug(availableInputs, 'sorted utxos:', sortedUtxos.length);
 
@@ -720,7 +734,8 @@ async function availableInputs(config: Config): Promise<InputPairWithMetadata[]>
       logger.error(availableInputs, 'failed to get transaction:', txError);
       continue;
     }
-logger.debug(availableInputs, 'got transaction for utxo:', txResult);
+    logger.debug(availableInputs, 'got transaction for utxo:', txResult);
+
     const txin = payjoin.PlainTxIn.create({
       previousOutput: payjoin.PlainOutPoint.create({
         txid: utxo.txid,
@@ -740,7 +755,8 @@ logger.debug(availableInputs, 'got transaction for utxo:', txResult);
         redeemScript: undefined,
         witnessScript: undefined,
     });
-logger.debug(availableInputs, 'created input pair for utxo:', txin, psbtIn);
+    logger.debug(availableInputs, 'created input pair for utxo:', txin, psbtIn);
+
     inputs.push({
       inputPair: new payjoin.InputPair(txin, psbtIn, undefined),
       txid: utxo.txid,
@@ -755,7 +771,8 @@ logger.debug(availableInputs, 'created input pair for utxo:', txin, psbtIn);
       break;
     }
   }
-logger.warn(availableInputs, 'selected inputs:', inputs);
+  logger.debug(availableInputs, 'selected inputs:', inputs);
+
   return inputs;
 }
 

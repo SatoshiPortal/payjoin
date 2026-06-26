@@ -242,11 +242,20 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
     throw new Error(`Failed to get fee rate: ${feeError}`);
   }
 
+  // Set nLockTime explicitly to the current block height to match the bdk-based
+  // mobile wallet, which always uses the exact chain tip for anti-fee-sniping.
+  const { error: chainInfoError, result: chainInfoResult } = await cnClient.getblockchaininfo();
+  if (chainInfoError || !chainInfoResult) {
+    throw new Error(`Failed to get blockchain info: ${chainInfoError}`);
+  }
+  const locktime = chainInfoResult.blocks;
+
   const { error: psbtError, result: psbtResult } = await cnClient.createFundedPsbt({
     inputs: [],
     outputs: {
       [address]: Utils.satsToBtc(amount),
     },
+    locktime,
     options: {
       lockUnspents: true,
       fee_rate: Number(feeResult.feerate),

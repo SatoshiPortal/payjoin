@@ -19,7 +19,8 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
   logger.info(receive, params);
 
   if (!params.address) {
-    const { error: addressError, result: addressResult } = await cnClient.getnewaddress({ wallet: config.RECEIVE_WALLET});
+    // Force bech32 to match the mobile wallet's bip84 default.
+    const { error: addressError, result: addressResult } = await cnClient.getnewaddress({ addressType: "bech32", wallet: config.RECEIVE_WALLET});
 
     if (addressError || !addressResult) {
       logger.error(receive, 'Failed to get new address:', addressError);

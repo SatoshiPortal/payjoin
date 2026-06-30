@@ -32,8 +32,10 @@ services:
       - "$GATEKEEPER_DATAPATH/certs/cert.pem:/payjoin/cert.pem:ro"
       - "$APP_SCRIPT_PATH/data/logs:/payjoin/logs"
     environment:
-      # need this in here because sync-request ignores rejectUnauthorized=false
-    - NODE_TLS_REJECT_UNAUTHORIZED=0
+      # Trust the gatekeeper's self-signed cert process-wide (sync-request ignores
+      # per-request CA opts) WITHOUT disabling TLS verification for external OHTTP
+      # relays/callbacks. cert.pem is mounted at /payjoin/cert.pem below.
+    - NODE_EXTRA_CA_CERTS=/payjoin/cert.pem
     - REPLICA_NUMBER={{.Task.Slot}}
     - TOTAL_REPLICAS=1
     networks:

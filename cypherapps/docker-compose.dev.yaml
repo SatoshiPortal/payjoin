@@ -27,8 +27,10 @@ services:
       context: .
       target: dev
     environment:
-      # need this in here because sync-request ignores rejectUnauthorized=false
-      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      # Trust the gatekeeper's self-signed cert process-wide (sync-request ignores
+      # per-request CA opts) WITHOUT disabling TLS verification for external OHTTP
+      # relays/callbacks. cert.pem is mounted at /payjoin/cert.pem below.
+      - NODE_EXTRA_CA_CERTS=/payjoin/cert.pem
       - REPLICA_NUMBER={{.Task.Slot}}
       - TOTAL_REPLICAS=2
     command: ["npm", "run", "start:dev"]

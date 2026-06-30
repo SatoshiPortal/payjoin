@@ -139,8 +139,11 @@ class CyphernodeClient {
       },
       data: postdata,
       httpsAgent: new https.Agent({
+        // Pin to the gatekeeper's self-signed cert: trust only this CA and
+        // verify the connection (cert + hostname against its SAN). Detects
+        // MITM/cert-swap instead of accepting any cert.
         ca: fs.readFileSync(this.caFile),
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
       }),
     };
     if (addedOptions) {
@@ -204,8 +207,11 @@ class CyphernodeClient {
         Authorization: "Bearer " + this._generateToken(),
       },
       httpsAgent: new https.Agent({
+        // Pin to the gatekeeper's self-signed cert: trust only this CA and
+        // verify the connection (cert + hostname against its SAN). Detects
+        // MITM/cert-swap instead of accepting any cert.
         ca: fs.readFileSync(this.caFile),
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
       }),
     };
     if (addedOptions) {

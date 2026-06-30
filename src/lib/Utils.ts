@@ -1,6 +1,5 @@
 import axios, { AxiosError, AxiosHeaders, AxiosRequestConfig } from "axios";
 import logger from "./Log2File";
-import https from "https";
 import { calculator } from "@dinero.js/calculator-bigint";
 import {
   createDinero,
@@ -43,9 +42,6 @@ class Utils {
       url: url,
       method: "post",
       data,
-      httpsAgent: new https.Agent({
-        rejectUnauthorized: false,
-      }),
     };
     if (headers) configs.headers = headers;
 

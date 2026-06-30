@@ -12,10 +12,12 @@ import IRespGetAddressInfo from "../types/cyphernode/IRespGetAddressInfo";
 import IRespDecodeScript from "../types/cyphernode/IRespDecodeScript";
 
 /**
- * NOTE: sync-request has an issue where it ignores rejectUnauthorized: false
- * so ENV NODE_TLS_REJECT_UNAUTHORIZED=0 must be set to ignore self-signed cert errors
- * 
- * This is not ideal but there doesn't seem to be a better way to do this. Perhaps can patch the package?!
+ * NOTE: sync-request ignores per-request agentOptions (ca / rejectUnauthorized),
+ * so we make the gatekeeper's self-signed cert trusted process-wide via the
+ * NODE_EXTRA_CA_CERTS env var (set to /payjoin/cert.pem in docker-compose).
+ * That keeps TLS verification ON for everything (gatekeeper, OHTTP relays,
+ * callbacks) instead of disabling it globally with NODE_TLS_REJECT_UNAUTHORIZED=0.
+ * Requires the gatekeeper cert's SAN to include the CN_URL host (e.g. `gatekeeper`).
  */
 export class SyncCyphernodeClient extends CyphernodeClient {
   constructor(config: Config) {
@@ -30,8 +32,6 @@ export class SyncCyphernodeClient extends CyphernodeClient {
   ): any {
     logger.info("SyncCyphernodeClient._post:", this.baseURL, url, postdata, addedOptions);
 
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
     try {
       let options: any = {
         json: postdata,
@@ -44,7 +44,7 @@ export class SyncCyphernodeClient extends CyphernodeClient {
       const ca = fs.readFileSync(this.caFile);
       options.agentOptions = {
         ca,
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
       };
 
       if (addedOptions) {
@@ -98,7 +98,7 @@ export class SyncCyphernodeClient extends CyphernodeClient {
 
       options.agentOptions = {
         ca: fs.readFileSync(this.caFile),
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
       };
 
       if (addedOptions) {

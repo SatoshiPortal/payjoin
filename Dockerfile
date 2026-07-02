@@ -32,8 +32,10 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN chown -R node:node /payjoin
-USER node
+RUN groupadd -g 1001 cyphernode \
+ && useradd -m -u 1001 -g 1001 -s /usr/sbin/nologin cyphernode
+RUN chown -R cyphernode:cyphernode /payjoin
+USER cyphernode
 
 EXPOSE 8000
 
@@ -69,8 +71,10 @@ RUN npm run build
 COPY scripts /payjoin/scripts
 RUN chmod +x /payjoin/scripts/entrypoint.sh
 
-RUN chown -R node:node /payjoin
-USER node
+RUN groupadd -g 1001 cyphernode \
+ && useradd -m -u 1001 -g 1001 -s /usr/sbin/nologin cyphernode
+RUN chown -R cyphernode:cyphernode /payjoin
+USER cyphernode
 
 EXPOSE 8000
 

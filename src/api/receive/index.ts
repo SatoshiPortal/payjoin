@@ -30,7 +30,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
     params.address = addressResult.address;
   }
 
-  if (!isValidAddress(params.address)) {
+  if (!(await isValidAddress(params.address))) {
     throw new JSONRPCErrorException('Invalid address', JSONRPCErrorCode.InvalidParams);
   }
 

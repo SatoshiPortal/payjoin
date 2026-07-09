@@ -1,7 +1,7 @@
 import { JSONRPCErrorCode, JSONRPCErrorException } from "json-rpc-2.0";
 import { addJsonRpcMethod } from "..";
 import logger from "../../lib/Log2File";
-import { isValidAddress, isValidBip21 } from "../../lib/validate";
+import { isValidAddress, isValidAmount, isValidBip21 } from "../../lib/validate";
 import { IReqSend, IRespSend } from "../../types/api/send";
 import { appendSendStatus, createSender, parseBip21 } from "../../lib/payjoin";
 import { config } from "../../config";
@@ -28,6 +28,16 @@ export async function send(params: IReqSend): Promise<IRespSend> {
     logger.debug('amount:', amount);
     logger.debug('address:', address);
     logger.debug('expiry:', expiry);
+
+    // A payjoin send requires a concrete amount: it's the value of the funded
+    // PSBT output. parseBip21 defaults a missing amount to 0, which would create
+    // a zero-value output, so reject anything without a positive amount.
+    if (!isValidAmount(amount)) {
+      throw new JSONRPCErrorException(
+        'bip21 must specify an amount',
+        JSONRPCErrorCode.InvalidParams
+      );
+    }
 
     // Check if the expiry has already passed
     if (expiry && expiry < new Date()) {

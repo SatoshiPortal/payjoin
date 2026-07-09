@@ -213,7 +213,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         const seenInputsMap = await loadSeenInputsFromDb(Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000);
         const sessionNewInputs = new Set<string>();
         receiver = receiver.checkNoInputsSeenBefore(
-          { callback: (outpoint: payjoin.PlainOutPoint) => isKnownProbe(outpoint, receiveSess.bip21!, sessionNewInputs, seenInputsMap) }
+          { callback: (outpoint: payjoin.OutPoint) => isKnownProbe(outpoint, receiveSess.bip21!, sessionNewInputs, seenInputsMap) }
         ).save(persister);
 
         await saveKnownInputs(receiveSess.bip21!, sessionNewInputs);
@@ -736,8 +736,8 @@ async function availableInputs(config: Config, targetSats: bigint): Promise<Inpu
     }
     logger.debug(availableInputs, 'got transaction for utxo:', txResult);
 
-    const txin = payjoin.PlainTxIn.create({
-      previousOutput: payjoin.PlainOutPoint.create({
+    const txin = payjoin.TxIn.create({
+      previousOutput: payjoin.OutPoint.create({
         txid: utxo.txid,
         vout: utxo.vout,
       }),
@@ -746,11 +746,11 @@ async function availableInputs(config: Config, targetSats: bigint): Promise<Inpu
       witness: [],
     });
 
-    const txOut = payjoin.PlainTxOut.create({
+    const txOut = payjoin.TxOut.create({
       valueSat: Utils.btcToSats(utxo.amount),
       scriptPubkey: new Uint8Array(Buffer.from(utxo.scriptPubKey, "hex")).buffer,
     });
-    const psbtIn = payjoin.PlainPsbtInput.create({
+    const psbtIn = payjoin.PsbtInput.create({
         witnessUtxo: txOut,
         redeemScript: undefined,
         witnessScript: undefined,

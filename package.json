@@ -66,7 +66,7 @@
     "express": "4.22.1",
     "https-proxy-agent": "7.0.6",
     "json-rpc-2.0": "1.7.0",
-    "payjoin": "0.1.1",
+    "payjoin": "file:vendor/payjoin-0.1.1.tgz",
     "pg": "8.20.0",
     "rimraf": "6.0.1",
     "sync-request": "6.1.0",

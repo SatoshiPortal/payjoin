@@ -57,7 +57,7 @@ function makeReceive(overrides: Partial<Receive> = {}): Receive {
     fee: null,
     receiverFee: null,
     fallbackTxHex: null,
-
+    fallbackAbandonedTs: null,
     callbackUrl: null,
     calledBackTs: null,
     expiryTs: null,

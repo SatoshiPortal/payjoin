@@ -1,4 +1,6 @@
-import { broadcastFallback, sumReceiverInputs, isKnownProbe } from './receive';
+import { broadcastFallback, sumReceiverInputs, checkNoInputsSeen } from './receive';
+import { SeenInputConflictError } from '../lib/seenInputs';
+import { ReceiverPersister } from '../lib/persister';
 import { Receive } from '@prisma/client';
 import { Config } from '../config';
 
@@ -21,6 +23,11 @@ jest.mock('../lib/db', () => ({
   db: {
     receive: { update: jest.fn().mockResolvedValue({ id: 1 }) },
   },
+}));
+
+jest.mock('../lib/seenInputs', () => ({
+  ...jest.requireActual('../lib/seenInputs'),
+  claimSeenInputsForSession: jest.fn(),
 }));
 
 jest.mock('../lib/Log2File', () => ({
@@ -67,6 +74,7 @@ function makeReceiveSess(overrides: Partial<Receive> = {}): Receive {
     fee: null,
     receiverFee: null,
     fallbackTxHex: FALLBACK_TX_HEX,
+    fallbackAbandonedTs: null,
     callbackUrl: null,
     calledBackTs: null,
     expiryTs: null,
@@ -128,55 +136,103 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// isKnownProbe — probing detection
+// checkNoInputsSeen — two-phase anti-probing adapter
 // ---------------------------------------------------------------------------
 
-describe('isKnownProbe — probing detection with session-local map', () => {
+describe('checkNoInputsSeen — durable claim before state persistence', () => {
+
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { claimSeenInputsForSession } = require('../lib/seenInputs');
 
   const BIP21_A = 'bitcoin:bc1qaaa?amount=0.001&pj=https://example.com';
-  const BIP21_B = 'bitcoin:bc1qbbb?amount=0.001&pj=https://example.com';
-  const outpoint = { txid: 'deadbeef', vout: 0n };
+  const SESSION_ID = 42;
+  const persister = { events: [] } as unknown as ReceiverPersister;
 
-  it('returns false and records outpoint when never seen before', () => {
-    const seenMap = new Map<string, string>();
-    const newInputs = new Set<string>();
+  // Fake MaybeInputsSeen receiver: each checkNoInputsSeenBefore call runs the
+  // callback over `outpoints` and returns a transition whose save() throws iff
+  // any outpoint was reported seen — mirroring the FFI, where the rejection
+  // transition's save() persists the error event and throws.
+  function makeFakeReceiver(outpoints: Array<{ txid: string; vout: bigint }>) {
+    const runs: Array<{ decisions: boolean[]; save: jest.Mock }> = [];
+    const receiver = {
+      checkNoInputsSeenBefore: ({ callback }: { callback: (o: { txid: string; vout: bigint }) => boolean }) => {
+        const decisions = outpoints.map((o) => callback(o));
+        const save = jest.fn(() => {
+          if (decisions.some(Boolean)) throw new Error('ReceiverPersistedError.Storage');
+          return 'NEXT_STATE';
+        });
+        runs.push({ decisions, save });
+        return { save };
+      },
+    };
+    return { receiver, runs };
+  }
 
-    const result = isKnownProbe(outpoint, BIP21_A, newInputs, seenMap);
+  const OUTPOINTS = [
+    { txid: 'deadbeef', vout: 0n },
+    { txid: 'cafebabe', vout: 1n },
+  ];
 
-    expect(result).toBe(false);
-    expect(newInputs.has('deadbeef:0')).toBe(true);
+  it('collects outpoints, claims them, then saves the tentative transition', async () => {
+    claimSeenInputsForSession.mockResolvedValue(undefined);
+    const { receiver, runs } = makeFakeReceiver(OUTPOINTS);
+
+    const next = await checkNoInputsSeen(receiver as never, BIP21_A, persister, SESSION_ID);
+
+    expect(next).toBe('NEXT_STATE');
+    // bigint vouts converted to numbers for the DB claim
+    expect(claimSeenInputsForSession).toHaveBeenCalledWith(BIP21_A, [
+      { txid: 'deadbeef', vout: 0 },
+      { txid: 'cafebabe', vout: 1 },
+    ]);
+    expect(runs).toHaveLength(1);
+    // phase 1 is collect-only: every outpoint tentatively reported unseen
+    expect(runs[0].decisions).toEqual([false, false]);
+    expect(runs[0].save).toHaveBeenCalledTimes(1);
+    expect(runs[0].save).toHaveBeenCalledWith(persister);
   });
 
-  it('returns false when outpoint was seen with the same BIP21', () => {
-    const seenMap = new Map([['deadbeef:0', BIP21_A]]);
-    const newInputs = new Set<string>();
+  it('does not save the transition until the claim has committed', async () => {
+    const { receiver, runs } = makeFakeReceiver(OUTPOINTS);
+    claimSeenInputsForSession.mockImplementation(async () => {
+      // At claim time the tentative transition must not have been persisted.
+      expect(runs[0].save).not.toHaveBeenCalled();
+    });
 
-    expect(isKnownProbe(outpoint, BIP21_A, newInputs, seenMap)).toBe(false);
+    await checkNoInputsSeen(receiver as never, BIP21_A, persister, SESSION_ID);
+
+    expect(runs[0].save).toHaveBeenCalledTimes(1);
   });
 
-  it('returns false when outpoint was seen with no BIP21 recorded', () => {
-    const seenMap = new Map([['deadbeef:0', '']]);
-    const newInputs = new Set<string>();
+  it('rejects the proposal via the PDK path on a cross-session conflict (probing attack)', async () => {
+    // Another session already claimed deadbeef:0 — the classic probing replay.
+    claimSeenInputsForSession.mockRejectedValue(new SeenInputConflictError(new Set(['deadbeef:0'])));
+    const { receiver, runs } = makeFakeReceiver(OUTPOINTS);
 
-    expect(isKnownProbe(outpoint, BIP21_A, newInputs, seenMap)).toBe(false);
+    // The rejection transition's save() throw must propagate so the caller's
+    // catch-all stamps failedTs → HasReplyableError → fallback broadcast.
+    await expect(checkNoInputsSeen(receiver as never, BIP21_A, persister, SESSION_ID))
+      .rejects.toThrow('ReceiverPersistedError.Storage');
+
+    expect(runs).toHaveLength(2);
+    // The tentative (unseen) transition was never persisted.
+    expect(runs[0].save).not.toHaveBeenCalled();
+    // The rerun reported exactly the conflicting outpoint as seen.
+    expect(runs[1].decisions).toEqual([true, false]);
+    expect(runs[1].save).toHaveBeenCalledTimes(1);
   });
 
-  it('returns true (probe detected) when outpoint was seen with a different BIP21', () => {
-    // Input X was already used in session for BIP21_A.
-    // Now a sender is presenting the same input for BIP21_B — classic probing attack.
-    const seenMap = new Map([['deadbeef:0', BIP21_A]]);
-    const newInputs = new Set<string>();
+  it('fails closed on a transient DB error: nothing saved, session retried next cycle', async () => {
+    claimSeenInputsForSession.mockRejectedValue(new Error('connection refused'));
+    const { receiver, runs } = makeFakeReceiver(OUTPOINTS);
 
-    expect(isKnownProbe(outpoint, BIP21_B, newInputs, seenMap)).toBe(true);
-  });
+    const next = await checkNoInputsSeen(receiver as never, BIP21_A, persister, SESSION_ID);
 
-  it('does not add outpoint to newInputs when it was already seen', () => {
-    const seenMap = new Map([['deadbeef:0', BIP21_A]]);
-    const newInputs = new Set<string>();
-
-    isKnownProbe(outpoint, BIP21_A, newInputs, seenMap);
-
-    expect(newInputs.size).toBe(0);
+    expect(next).toBeNull();
+    expect(runs).toHaveLength(1);
+    // No state transition persisted — no receiver input can be selected or
+    // signed; the session replays MaybeInputsSeen on the next cron cycle.
+    expect(runs[0].save).not.toHaveBeenCalled();
   });
 
 });
@@ -280,6 +336,61 @@ describe('broadcastFallback — output substitution address bug', () => {
     await broadcastFallback(makeReceiveSess(), mockConfig as Config);
 
     expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('abandons retries when inputs are already spent, preserving the original failure reason', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+    cnClient.sendRawTransaction.mockResolvedValue({
+      result: null,
+      error: { code: -25, message: 'bad-txns-inputs-missingorspent' },
+    });
+
+    await broadcastFallback(
+      makeReceiveSess({ failedReason: 'OriginalPsbtRejected: The receiver rejected the original PSBT.' }),
+      mockConfig as Config,
+    );
+
+    const updateArgs = db.receive.update.mock.calls[0][0];
+    // dropped from the retry queue via fallbackAbandonedTs, keeping fallbackTxHex for history ...
+    expect(updateArgs.data.fallbackAbandonedTs).toBeInstanceOf(Date);
+    expect(updateArgs.data).not.toHaveProperty('fallbackTxHex');
+    expect(updateArgs.data.failedReason).toBe(
+      'OriginalPsbtRejected: The receiver rejected the original PSBT.; fallback abandoned: inputs already spent',
+    );
+    // ... without ever claiming payment — only the address watch may do that
+    expect(updateArgs.data).not.toHaveProperty('txid');
+    expect(updateArgs.data).not.toHaveProperty('amount');
+    expect(updateArgs.data).not.toHaveProperty('fallbackTs');
+  });
+
+  it('abandons retries when the tx is already in chain, without claiming payment', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+    cnClient.sendRawTransaction.mockResolvedValue({
+      result: null,
+      error: { code: -27, message: 'Transaction already in block chain' },
+    });
+
+    await broadcastFallback(makeReceiveSess(), mockConfig as Config);
+
+    const updateArgs = db.receive.update.mock.calls[0][0];
+    expect(updateArgs.data.fallbackAbandonedTs).toBeInstanceOf(Date);
+    expect(updateArgs.data).not.toHaveProperty('fallbackTxHex');
+    expect(updateArgs.data.failedReason).toContain('tx already broadcast');
+    expect(updateArgs.data).not.toHaveProperty('txid');
+    expect(updateArgs.data).not.toHaveProperty('amount');
+    expect(updateArgs.data).not.toHaveProperty('fallbackTs');
+  });
+
+  it('keeps retrying on transient broadcast errors (no record change)', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+    cnClient.sendRawTransaction.mockResolvedValue({
+      result: null,
+      error: { code: -26, message: 'txn-mempool-conflict' },
+    });
+
+    await broadcastFallback(makeReceiveSess(), mockConfig as Config);
+
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 

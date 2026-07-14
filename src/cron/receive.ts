@@ -9,6 +9,7 @@ import { AxiosError } from "axios";
 import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, randomRelay, recordRelayFailure } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
+import { claimSeenInputsForSession, outpointKey, SeenInputConflictError, SeenOutpoint } from "../lib/seenInputs";
 
   interface InputPairWithMetadata {
     inputPair: payjoin.InputPair;
@@ -20,8 +21,6 @@ import { ReceiverPersister } from "../lib/persister";
 
 export async function restoreReceiveSessions(config: Config) {
   logger.info(restoreReceiveSessions, 'restoring receive sessions');
-
-  await cleanupSeenInputs(Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000);
 
   const { replicaId, totalReplicas } = Utils.replicaInfo();
 
@@ -56,6 +55,7 @@ export async function restoreReceiveSessions(config: Config) {
         lte: new Date(Date.now() - 2 * 60 * 1000) // Current date minus 2 minutes
       },
       fallbackTxHex: { not: null },
+      fallbackAbandonedTs: null,
       txid: null,
     }
   });
@@ -210,13 +210,9 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.MaybeInputsSeen) {
         logger.debug(processReceiveSession, 'Receiver is in MaybeInputsSeen state');
 
-        const seenInputsMap = await loadSeenInputsFromDb(Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000);
-        const sessionNewInputs = new Set<string>();
-        receiver = receiver.checkNoInputsSeenBefore(
-          { callback: (outpoint: payjoin.OutPoint) => isKnownProbe(outpoint, receiveSess.bip21!, sessionNewInputs, seenInputsMap) }
-        ).save(persister);
-
-        await saveKnownInputs(receiveSess.bip21!, sessionNewInputs);
+        const next = await checkNoInputsSeen(receiver, receiveSess.bip21!, persister, receiveSess.id);
+        if (next === null) return; // transient DB failure — fail closed, retry next cycle
+        receiver = next;
 
         logger.debug('checkNoInputsSeenBefore complete');
       }
@@ -641,61 +637,61 @@ function isOwned(script: ArrayBuffer, config: Config): boolean {
   return false;
 }
 
-export function isKnownProbe(
-  outpoint: { txid: string; vout: number | bigint },
-  currentBip21: string,
-  newInputs: Set<string>,
-  seenInputsMap: Map<string, string>,
-): boolean {
-  const outpointKey = `${outpoint.txid}:${outpoint.vout}`;
-  const seenBip21 = seenInputsMap.get(outpointKey);
+/**
+ * Two-phase seen-input check (BIP 78 anti-probing). The PDK state
+ * transition is only persisted AFTER the outpoint claims are durably committed,
+ * so a crash or DB failure can never let a session proceed without a claim.
+ *
+ * Returns the next receiver state on success, or null on a transient DB
+ * failure — nothing was saved, so the session replays MaybeInputsSeen next
+ * cron cycle (same semantics as the long-poll timeout retry paths; throwing
+ * instead would stamp failedTs and burn the payjoin on a DB blip).
+ *
+ * On a cross-session conflict the rejection transition's save() throws; that
+ * propagates to processReceiveSession's catch-all, which stamps
+ * failedTs/failedReason. The next cycle replays to HasReplyableError, delivers
+ * the error to the sender, and broadcastFallback later broadcasts the fallback.
+ */
+export async function checkNoInputsSeen(
+  receiver: payjoin.MaybeInputsSeen,
+  bip21: string,
+  persister: ReceiverPersister,
+  sessionId: number,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<any | null> {
+  // Phase 1: collect-only pass — gather outpoints, tentatively report every
+  // one unseen, and HOLD the resulting transition without saving it.
+  const collected: SeenOutpoint[] = [];
+  const tentative = receiver.checkNoInputsSeenBefore({
+    callback: (outpoint: payjoin.OutPoint) => {
+      collected.push({ txid: outpoint.txid, vout: Number(outpoint.vout) });
+      return false;
+    },
+  });
 
-  if (seenBip21 === undefined) {
-    newInputs.add(outpointKey);
-    return false;
-  }
-
-  if (seenBip21 === currentBip21 || seenBip21 === '') {
-    return false;
-  }
-
-  logger.debug(isKnownProbe, 'probe detected — outpoint seen with different BIP21:',
-    outpointKey, 'seen:', seenBip21, 'current:', currentBip21);
-  return true;
-}
-
-async function loadSeenInputsFromDb(expiryWindowMs: number): Promise<Map<string, string>> {
-  const cutoff = new Date(Date.now() - expiryWindowMs);
-  const recentInputs = await db.seenInputs.findMany({ where: { createdTs: { gt: cutoff } } });
-  return new Map(recentInputs.map(input => [`${input.txid}:${input.vout}`, input.bip21 || '']));
-}
-
-async function cleanupSeenInputs(expiryWindowMs: number): Promise<void> {
-  const cutoff = new Date(Date.now() - expiryWindowMs);
+  // Phase 2: durably claim the outpoints before persisting protocol progress.
   try {
-    const { count } = await db.seenInputs.deleteMany({ where: { createdTs: { lte: cutoff } } });
-    if (count > 0) logger.info(cleanupSeenInputs, `deleted ${count} expired seen_inputs rows`);
+    await claimSeenInputsForSession(bip21, collected);
   } catch (e) {
-    logger.error(cleanupSeenInputs, 'failed to clean up seen_inputs:', e);
+    if (e instanceof SeenInputConflictError) {
+      logger.warn(checkNoInputsSeen,
+        `seen-input conflict for session ${sessionId} — rejecting proposal as probe:`, [...e.conflicts]);
+      // Rerun on the same receiver (the FFI method takes &self and clones
+      // internally — re-verify on payjoin npm upgrades), now reporting the
+      // conflicting outpoints as seen so the normal PDK rejection is what
+      // gets persisted. This save() throws to the caller's catch-all.
+      receiver.checkNoInputsSeenBefore({
+        callback: (outpoint: payjoin.OutPoint) => e.conflicts.has(outpointKey(outpoint)),
+      }).save(persister);
+      return null; // defensive — save() throws for the rejection transition
+    }
+    logger.error(checkNoInputsSeen,
+      `seen-input claim failed — failing closed, retrying next cycle (session ${sessionId}):`, e);
+    return null;
   }
-}
 
-async function saveKnownInputs(bip21: string, newInputs: Set<string>) {
-  const newInputsArray = Array.from(newInputs);
-  if (newInputsArray.length === 0) return;
-
-  try {
-    await db.seenInputs.createMany({
-      data: newInputsArray.map((input) => {
-        const [txid, vout] = input.split(':');
-        return { txid, vout: Number(vout), bip21 };
-      }),
-      skipDuplicates: true,
-    });
-    logger.debug(saveKnownInputs, 'saved new inputs:', newInputsArray);
-  } catch (e) {
-    logger.error(saveKnownInputs, 'failed to save new inputs:', e);
-  }
+  // Claims are durable — only now persist the successful transition.
+  return tentative.save(persister);
 }
 
 async function availableInputs(config: Config, targetSats: bigint): Promise<InputPairWithMetadata[]> {
@@ -847,6 +843,37 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
   });
 
   if (sendError || !sendResult) {
+    const errMsg = String(sendError?.message ?? '');
+
+    // Errors that can never clear on retry:
+    //  - inputs already spent: a conflicting confirmed tx consumed the same
+    //    outpoints (e.g. the winning session's fallback after a rejected probe)
+    //  - already in chain: this exact tx is already confirmed, so the sender
+    //    beat us to the broadcast
+    // In both cases stop retrying: stamp fallbackAbandonedTs to drop the
+    // session out of the retry queue (fallbackTxHex is kept for the record)
+    // and note why. Payment accounting is never done here — only the
+    // address-watch callback may mark a session as paid.
+    const terminalReason =
+      /missingorspent|missing inputs/i.test(errMsg) ? 'inputs already spent' :
+      /already in block ?chain|txn-already-known|already known|outputs already in utxo set/i.test(errMsg)
+        ? 'tx already broadcast' :
+      null;
+
+    if (terminalReason) {
+      logger.warn(broadcastFallback, `abandoning fallback retries for session ${receiveSess.id}: ${terminalReason}`);
+      await db.receive.update({
+        where: { id: receiveSess.id },
+        data: {
+          fallbackAbandonedTs: new Date(),
+          failedReason: `${receiveSess.failedReason ?? 'fallback failed'}; fallback abandoned: ${terminalReason}`,
+        },
+      }).catch((e) => logger.error(broadcastFallback, 'failed to mark fallback abandoned:', e));
+      return;
+    }
+
+    // anything else (mempool conflict, fee policy, transient RPC failure) may
+    // clear on its own — leave the session in the queue and retry next cron
     logger.error(broadcastFallback, 'failed to broadcast fallback tx:', sendError);
     return;
   }

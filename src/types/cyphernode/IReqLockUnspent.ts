@@ -5,5 +5,6 @@ export interface IReqLockUnspent {
     txid: string;
     vout: number;
   }[];
+  persistent?: boolean;
   wallet?: string;
 }

@@ -60,6 +60,8 @@ model Receive {
   receiverFee         BigInt?       @map("receiver_fee")
   fallbackTxHex       String?       @map("fallback_tx_hex")
   fallbackAbandonedTs DateTime?     @map("fallback_abandoned_ts")
+  reservedInputTxid   String?       @map("reserved_input_txid")
+  reservedInputVout   Int?          @map("reserved_input_vout")
   callbackUrl         String?       @map("callback_url")
   calledBackTs        DateTime?     @map("called_back_ts")
   expiryTs            DateTime?     @map("expiry_ts")
@@ -75,6 +77,7 @@ model Receive {
   createdTs           DateTime      @default(now()) @map("created_ts")
   updatedTs           DateTime      @updatedAt @map("updated_ts")
 
+  @@unique([reservedInputTxid, reservedInputVout])
   @@index([bip21])
   @@index([address])
   @@index([txid])

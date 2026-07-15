@@ -6,7 +6,7 @@ import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, randomRelay, recordRelayFailure } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, randomRelay, recordRelayFailure, sessionHasPostedProposal } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 import { claimSeenInputsForSession, outpointKey, SeenInputConflictError, SeenOutpoint } from "../lib/seenInputs";
@@ -66,6 +66,30 @@ export async function restoreReceiveSessions(config: Config) {
   await Promise.all(
     failedSessions.map(receiveSess => broadcastFallback(receiveSess, config))
   );
+
+  // release receiver-input reservations held by sessions that reached a
+  // terminal state (issue #8) — releaseReservedInput applies the
+  // posted/confirmed safety rules per row
+  const allTerminalReserved = await db.receive.findMany({
+    where: {
+      reservedInputTxid: { not: null },
+      OR: [
+        { confirmedTs: { not: null } },
+        { cancelledTs: { not: null } },
+        { fallbackAbandonedTs: { not: null } },
+        { expiryTs: { lte: new Date() } },
+      ],
+    }
+  });
+  const terminalReserved = allTerminalReserved.filter(session => {
+    return session.id % totalReplicas === (replicaId - 1);
+  });
+  if (terminalReserved.length > 0) {
+    logger.info(restoreReceiveSessions, `found ${terminalReserved.length} terminal sessions with reserved inputs to release`);
+    await Promise.all(
+      terminalReserved.map(receiveSess => releaseReservedInput(receiveSess, config))
+    );
+  }
 }
 
 async function processReceiveSession(receiveSess: Receive, config: Config) {
@@ -332,37 +356,24 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug('commitOutputs complete');
       }
 
-      // get appropriate inputs to contribute - these are outside the WantsInputs block as we use them later also
-      // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
-      const inputs = await availableInputs(config, receiveSess.amount);
-      logger.debug(processReceiveSession, 'selected inputs:', inputs);
-
       if (receiver instanceof payjoin.WantsInputs) {
         logger.debug(processReceiveSession, 'Receiver is in WantsInputs state');
+
+        // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
+        const inputs = await availableInputs(config, receiveSess.amount);
+        logger.debug(processReceiveSession, 'selected inputs:', inputs);
 
         if (inputs.length === 0) {
           logger.error(processReceiveSession, 'no inputs found to contribute');
           return;
         }
 
+        // The selected InputPair cannot be identified here: the FFI returns a
+        // freshly lifted wrapper object with no outpoint accessors. The
+        // committed outpoint is instead recovered from the CommittedInputs
+        // session event and reserved below, before any signing.
         const inputPairs = inputs.map((input) => input.inputPair);
-        const selectedInput = receiver.tryPreservingPrivacy(inputPairs);
-        logger.debug("SELECTED INPUT:", selectedInput, JSON.stringify(selectedInput));
-
-        // Lock the selected UTXO BEFORE signing to close the race window where
-        // two concurrent sessions could both select and sign with the same UTXO.
-        // indexOf uses identity (===) — works as long as the SDK returns the same
-        // InputPair reference it was given, which the WASM bindings do.
-        // Cast to InputPairLike[] so indexOf accepts the InputPairLike return type
-        // from tryPreservingPrivacy without a type error.
-        const selectedIndex = (inputPairs as payjoin.InputPairLike[]).indexOf(selectedInput);
-        if (selectedIndex >= 0) {
-          const { txid, vout } = inputs[selectedIndex];
-          logger.info(processReceiveSession, 'locking selected input before signing:', txid, vout);
-          await cnClient.lockUnspent({ utxos: [{ txid, vout: Number(vout) }], wallet: config.RECEIVE_WALLET });
-        } else {
-          logger.warn(processReceiveSession, 'could not match selected InputPair to metadata — UTXO lock deferred to after signing');
-        }
+        const selectedInput: payjoin.InputPairLike = receiver.tryPreservingPrivacy(inputPairs);
 
         receiver = receiver.contributeInputs([selectedInput])
           .commitInputs()
@@ -370,7 +381,23 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
         logger.debug('tryContributeInputs complete');
       }
-      
+
+      // Reserve the committed receiver input before signing (issue #8): record
+      // it on the Receive row (unique constraint = cross-session/replica claim)
+      // and hold a persistent wallet lock. Runs on every pass, including
+      // replayed sessions already past WantsInputs, so a crash between commit
+      // and lock is healed here. Failing to reserve must abort before
+      // finalizeProposal — never sign with an unreserved input.
+      if (
+        receiver instanceof payjoin.WantsFeeRange ||
+        receiver instanceof payjoin.ProvisionalProposal ||
+        receiver instanceof payjoin.PayjoinProposal
+      ) {
+        const reserved = await reserveCommittedInput(receiveSess, persister.load(), config);
+        if (!reserved) return;
+        receiveSess = reserved;
+      }
+
       if (receiver instanceof payjoin.WantsFeeRange) {
         logger.debug(processReceiveSession, 'Receiver is in WantsFeeRange state');
 
@@ -415,13 +442,17 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
         logger.debug(processReceiveSession, 'total fee:', totalFee);
 
+        // classify by the reserved outpoint rather than a fresh listunspent —
+        // the contributed coin is wallet-locked, so on a retried pass it would
+        // be missing from availableInputs and misclassified as the sender's
         const txInputs = decodedFinalPsbtResult.inputs.map((input, index) => {
           const address = input.witness_utxo?.scriptPubKey?.address ?? null;
           const amount = Utils.btcToSats(input.witness_utxo?.amount || 0);
           const outpoint = decodedFinalPsbtResult.tx.vin[index];
-          const ownedBy: 'sender' | 'receiver' = outpoint != null && inputs.some(
-            (c) => c.txid === outpoint.txid && Number(c.vout) === outpoint.vout
-          ) ? 'receiver' : 'sender';
+          const ownedBy: 'sender' | 'receiver' = outpoint != null
+            && outpoint.txid === receiveSess.reservedInputTxid
+            && outpoint.vout === receiveSess.reservedInputVout
+            ? 'receiver' : 'sender';
           return { address, amount: amount.toString(), ownedBy };
         });
 
@@ -510,23 +541,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         const txid = decodedFinalPsbtResult.tx.txid;
         logger.debug(processReceiveSession, 'proposal txid:', txid);
 
-        // lock utxos using utxosToBeLocked
-        const toLock = receiver.utxosToBeLocked();
-        logger.debug(processReceiveSession, 'utxos to be locked:', toLock);
-
-        if (toLock && toLock.length > 0) {
-          const lockUtxos = toLock.map((utxo) => {
-            const { txid, vout } = utxo;
-            return {
-              txid,
-              vout: Number(vout),
-            }
-          });
-
-          for (const utxo of lockUtxos) {
-            await cnClient.lockUnspent({ utxos: [utxo], wallet: config.RECEIVE_WALLET });
-          }
-        }
+        // NOTE: no utxosToBeLocked() here — it returns every proposal input,
+        // the sender's included, and upstream PDK removed the API for that
+        // reason. The receiver's own input was already reserved and locked by
+        // reserveCommittedInput() before signing.
 
         // flush persisted state before sending the proposal so a crash after send can replay correctly
         await persister.flush();
@@ -694,7 +712,179 @@ export async function checkNoInputsSeen(
   return tentative.save(persister);
 }
 
-async function availableInputs(config: Config, targetSats: bigint): Promise<InputPairWithMetadata[]> {
+/**
+ * Reserve the receiver input committed to this session's payjoin proposal
+ * (issue #8): record the outpoint on the Receive row — the composite unique
+ * constraint makes the claim atomic across sessions and replicas — then hold
+ * a persistent wallet lock so the coin survives bitcoind restarts and is
+ * excluded from other sessions' availableInputs.
+ *
+ * Idempotent: a re-pass of a session that already owns its claim only
+ * re-verifies the wallet lock ("already locked" is safely ours by virtue of
+ * the DB claim). Returns the up-to-date Receive row, or null if the session
+ * must not proceed to signing:
+ *  - claim conflict (another session owns the outpoint) or an unidentifiable
+ *    committed input stamps failedTs, so the existing fallback machinery
+ *    closes the session (the fallback never spends this input, so it is safe);
+ *  - a transient lock/DB failure stamps nothing and is retried next cycle.
+ */
+export async function reserveCommittedInput(receiveSess: Receive, sessionEvents: unknown[], config: Config): Promise<Receive | null> {
+  const committed = extractCommittedInputs(sessionEvents);
+  if (!committed || committed.length !== 1) {
+    logger.error(reserveCommittedInput, `cannot identify committed receiver input for session ${receiveSess.id}:`, committed);
+    await db.receive.updateMany({
+      where: { id: receiveSess.id, failedTs: null },
+      data: { failedTs: new Date(), failedReason: 'input_reservation_failed: cannot identify committed receiver input' },
+    });
+    return null;
+  }
+  const { txid, vout } = committed[0];
+
+  if (receiveSess.reservedInputTxid !== txid || receiveSess.reservedInputVout !== vout) {
+    if (receiveSess.reservedInputTxid != null) {
+      // a session's committed input is immutable, so a mismatch means corrupted state
+      logger.error(reserveCommittedInput,
+        `session ${receiveSess.id} reserved ${receiveSess.reservedInputTxid}:${receiveSess.reservedInputVout} but committed ${txid}:${vout}`);
+      await db.receive.updateMany({
+        where: { id: receiveSess.id, failedTs: null },
+        data: { failedTs: new Date(), failedReason: 'input_reservation_failed: reservation does not match committed input' },
+      });
+      return null;
+    }
+
+    try {
+      receiveSess = await db.receive.update({
+        where: { id: receiveSess.id },
+        data: { reservedInputTxid: txid, reservedInputVout: vout },
+      });
+      logger.info(reserveCommittedInput, `reserved input ${txid}:${vout} for session ${receiveSess.id}`);
+    } catch (e) {
+      if ((e as { code?: string })?.code === 'P2002') {
+        logger.warn(reserveCommittedInput,
+          `input ${txid}:${vout} is reserved by another session — failing session ${receiveSess.id}`);
+        await db.receive.updateMany({
+          where: { id: receiveSess.id, failedTs: null },
+          data: { failedTs: new Date(), failedReason: `input_reservation_conflict: ${txid}:${vout} reserved by another session` },
+        });
+      } else {
+        logger.error(reserveCommittedInput, `failed to record reservation for session ${receiveSess.id} — retrying next cycle:`, e);
+      }
+      return null;
+    }
+  }
+
+  const { error, result } = await cnClient.lockUnspent({
+    utxos: [{ txid, vout }],
+    persistent: true,
+    wallet: config.RECEIVE_WALLET,
+  });
+  if (!error && result?.success === true) return receiveSess;
+
+  // The wallet lock has no owner concept; the DB claim above is what makes an
+  // existing lock safely ours (an idempotent re-pass, or a lock from a pass
+  // that crashed before signing).
+  if (/already locked/i.test(String(error?.message ?? ''))) return receiveSess;
+
+  logger.error(reserveCommittedInput,
+    `failed to lock reserved input ${txid}:${vout} for session ${receiveSess.id} — not signing:`, error ?? result);
+  return null;
+}
+
+/**
+ * Idempotent release of a terminal session's receiver-input reservation
+ * (issue #8). Operates only on the outpoint recorded on this Receive row —
+ * never on the wallet's global lock list.
+ *
+ * Release rules:
+ *  - proposal never posted: the receiver-signed proposal is unbroadcastable
+ *    (the sender must re-sign its inputs) and the fallback does not spend our
+ *    input, so a cancelled/expired/failed session unlocks and releases
+ *    immediately;
+ *  - proposal posted: hold until confirmedTs. A tx seen only in the mempool
+ *    never sets confirmedTs, so it never releases anything. Once confirmed:
+ *      - the payjoin itself confirmed: the reserved input is spent and Core
+ *        removed its wallet lock when the spending tx arrived — just clear
+ *        the reservation, no unlock RPC;
+ *      - the conflicting original/fallback confirmed: the input is unspent,
+ *        so unlock it and clear;
+ *      - the confirmed tx is neither (an unrelated payment to the same
+ *        address): keep the reservation — the posted proposal could still be
+ *        broadcast.
+ *
+ * When an unlock is needed, the reservation is only cleared after it succeeds
+ * or the outpoint is already gone/unlocked; otherwise the next sweep retries.
+ */
+export async function releaseReservedInput(receiveSess: Receive, config: Config) {
+  await lock.acquire([receiveSess.id.toString(), receiveSess.address], async () => {
+    try {
+      // re-read inside the lock — processReceiveSession may have just run
+      const fresh = await db.receive.findUnique({ where: { id: receiveSess.id } });
+      if (!fresh?.reservedInputTxid || fresh.reservedInputVout == null) return;
+
+      const utxo = { txid: fresh.reservedInputTxid, vout: fresh.reservedInputVout };
+      // true when the reserved input was spent by the confirmed payjoin —
+      // nothing left to unlock (Core removed the lock when the tx arrived)
+      let spentByPayjoin = false;
+
+      const posted = sessionHasPostedProposal(fresh.session);
+      if (posted) {
+        if (!fresh.confirmedTs) {
+          logger.debug(releaseReservedInput, `session ${fresh.id} posted its proposal but has no confirmed outcome — keeping reservation`);
+          return;
+        }
+        if (fresh.nonPayjoinTs) {
+          // The confirmed tx is not the proposal. It is almost always the
+          // sender-broadcast original (which conflicts with the proposal), but
+          // an unrelated payment to the watched address takes the same code
+          // path — only the original proves the proposal can no longer confirm.
+          let originalTxid: string | undefined;
+          if (fresh.fallbackTxHex) {
+            const { result: decodeResult } = await cnClient.decodeRawTransaction({ hex: fresh.fallbackTxHex });
+            originalTxid = decodeResult?.tx?.txid;
+          }
+          if (!originalTxid || fresh.txid !== originalTxid) {
+            logger.warn(releaseReservedInput,
+              `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original — keeping reservation`);
+            return;
+          }
+        } else if (!fresh.fallbackTs) {
+          // row.txid is the proposal itself (only the non-payjoin/fallback
+          // paths overwrite it), so the confirmed tx spent our input
+          spentByPayjoin = true;
+        }
+      }
+
+      if (!spentByPayjoin) {
+        const { error, result } = await cnClient.lockUnspent({
+          unlock: true,
+          persistent: true,
+          utxos: [utxo],
+          wallet: config.RECEIVE_WALLET,
+        });
+        // Defensive: treat already-gone outpoints as released (coin spent
+        // outside the session — "expected unspent output" — or lock already
+        // dropped). Core removes a lock itself when a spending tx arrives.
+        const released = (!error && result?.success === true)
+          || /expected unspent output|expected locked output|unknown transaction|vout index out of bounds/i.test(String(error?.message ?? ''));
+        if (!released) {
+          logger.error(releaseReservedInput,
+            `failed to unlock ${utxo.txid}:${utxo.vout} for session ${fresh.id} — will retry next sweep:`, error ?? result);
+          return;
+        }
+      }
+
+      await db.receive.update({
+        where: { id: fresh.id },
+        data: { reservedInputTxid: null, reservedInputVout: null },
+      });
+      logger.info(releaseReservedInput, `released reserved input ${utxo.txid}:${utxo.vout} for session ${fresh.id}`);
+    } catch (e) {
+      logger.error(releaseReservedInput, `failed to release reservation for session ${receiveSess.id}:`, e);
+    }
+  });
+}
+
+export async function availableInputs(config: Config, targetSats: bigint): Promise<InputPairWithMetadata[]> {
   const { error: utxosError, result: utxosResult } = await cnClient.listUnspent({ wallet: config.RECEIVE_WALLET });
   if (utxosError || !utxosResult) {
     logger.error(availableInputs, 'failed to list unspent:', utxosError);
@@ -702,6 +892,23 @@ async function availableInputs(config: Config, targetSats: bigint): Promise<Inpu
   }
 
   logger.debug(availableInputs, 'found utxos:', utxosResult.utxos.length);
+
+  // Exclude outpoints reserved by other sessions (issue #8). The DB
+  // reservation, not wallet-lock state, is the source of truth: Core removes
+  // the wallet lock as soon as the payjoin tx enters the mempool, and the lock
+  // can lag the claim in the crash window before reserveCommittedInput heals
+  // it. Cheap by construction — reservations are cleared on release, so this
+  // only ever returns currently-held rows via the unique index.
+  const reservedRows = await db.receive.findMany({
+    where: { reservedInputTxid: { not: null } },
+    select: { reservedInputTxid: true, reservedInputVout: true },
+  });
+  const reserved = new Set(
+    reservedRows.map((r) => outpointKey({ txid: r.reservedInputTxid!, vout: r.reservedInputVout! }))
+  );
+  if (reserved.size > 0) {
+    logger.debug(availableInputs, 'excluding reserved outpoints:', [...reserved]);
+  }
 
   // Order candidates by how close their value is to the payment amount, closest first.
   //
@@ -715,7 +922,10 @@ async function availableInputs(config: Config, targetSats: bigint): Promise<Inpu
   // receiver's.
   const abs = (n: bigint): bigint => (n < 0n ? -n : n);
   const sortedUtxos = [...utxosResult.utxos]
-    .filter((utxo) => utxo.confirmations > 0 && Utils.btcToSats(utxo.amount) > 0n)
+    .filter((utxo) =>
+      utxo.confirmations > 0 &&
+      Utils.btcToSats(utxo.amount) > 0n &&
+      !reserved.has(outpointKey(utxo)))
     .sort((a, b) => {
       const da = abs(Utils.btcToSats(a.amount) - targetSats);
       const db = abs(Utils.btcToSats(b.amount) - targetSats);

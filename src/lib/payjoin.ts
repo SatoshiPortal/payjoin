@@ -195,6 +195,58 @@ export function extractReplyableError(sessionJson: string | null | undefined): s
   return reason;
 }
 
+/**
+ * Extract the receiver input committed to the payjoin proposal from the
+ * session event log (issue #8).
+ *
+ * The FFI's `tryPreservingPrivacy` return value exposes no outpoint accessors,
+ * so the committed input can only be identified from the `CommittedInputs`
+ * event that `commitInputs()` persists. Each event is a JSON-encoded string
+ * shaped like `{"CommittedInputs":[{"txin":{"previous_output":"<txid>:<vout>",...},...}]}`
+ * (`bitcoin::OutPoint` serializes as a "txid:vout" string in JSON).
+ *
+ * Accepts the in-memory event array from `ReceiverPersister.load()`. Returns
+ * the outpoints of the committed inputs from the most recent event, or
+ * undefined if inputs were never committed. The current flow contributes
+ * exactly one receiver input, but all are returned so a future multi-input
+ * flow fails loudly in the caller rather than silently dropping locks.
+ */
+export function extractCommittedInputs(events: unknown[]): { txid: string; vout: number }[] | undefined {
+  if (!Array.isArray(events)) return undefined;
+
+  let committed: { txid: string; vout: number }[] | undefined;
+  for (const ev of events) {
+    let parsed: unknown;
+    try { parsed = typeof ev === 'string' ? JSON.parse(ev) : ev; } catch { continue; }
+    const inputs = (parsed as { CommittedInputs?: Array<{ txin?: { previous_output?: string } }> })?.CommittedInputs;
+    if (!Array.isArray(inputs)) continue;
+
+    const outpoints: { txid: string; vout: number }[] = [];
+    for (const input of inputs) {
+      const prevout = input?.txin?.previous_output;
+      if (typeof prevout !== 'string') return undefined; // unexpected shape — fail loudly upstream
+      const sep = prevout.lastIndexOf(':');
+      const txid = prevout.slice(0, sep);
+      const vout = Number(prevout.slice(sep + 1));
+      if (sep <= 0 || !/^[0-9a-f]{64}$/i.test(txid) || !Number.isInteger(vout) || vout < 0) return undefined;
+      outpoints.push({ txid, vout });
+    }
+    committed = outpoints;
+  }
+  return committed;
+}
+
+/**
+ * Whether the session event log records that the payjoin proposal was posted
+ * to the directory. Once posted, the sender may hold a broadcastable payjoin
+ * tx, so the receiver's contributed input must stay reserved until an on-chain
+ * outcome confirms. Events are JSON-encoded strings, so a quoted-name search
+ * is reliable regardless of escaping depth.
+ */
+export function sessionHasPostedProposal(sessionJson: string | null | undefined): boolean {
+  return !!sessionJson && sessionJson.includes('PostedPayjoinProposal');
+}
+
 export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string; ohttpRelay: string }> {
   logger.info(createReceiver, `Creating receiver for address: ${address} amount: ${amount}`);
 
@@ -309,7 +361,9 @@ export function appendReceiveStatus(receive: Receive) {
   }
 
   return {
-    ...Utils.omit(receive, ['session']),
+    // reservedInput* is internal wallet-reservation bookkeeping (issue #8) —
+    // never expose wallet outpoints through the API or callbacks
+    ...Utils.omit(receive, ['session', 'reservedInputTxid', 'reservedInputVout']),
     status
   } as IRespReceive;
 }

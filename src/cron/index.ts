@@ -35,8 +35,10 @@ export function startCron(config: Config) {
       try {
         await lock.acquire(replicaLockName, async () => {
           logger.info(runJob, "Lock acquired. Restoring sessions...");
-          await restoreSendSessions(config);
-          await restoreReceiveSessions(config);
+          await Promise.all([
+            restoreSendSessions(config),
+            restoreReceiveSessions(config),
+          ]);
           logger.info(runJob, "Sessions processed. Releasing lock");
         });
       } catch (e) {

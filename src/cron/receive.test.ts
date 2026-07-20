@@ -1,4 +1,4 @@
-import { broadcastFallback, sumReceiverInputs, checkNoInputsSeen } from './receive';
+import { broadcastFallback, sumReceiverInputs, checkNoInputsSeen, reserveCommittedInput, releaseReservedInput, availableInputs } from './receive';
 import { SeenInputConflictError } from '../lib/seenInputs';
 import { ReceiverPersister } from '../lib/persister';
 import { Receive } from '@prisma/client';
@@ -8,12 +8,24 @@ import { Config } from '../config';
 // Module mocks
 // ---------------------------------------------------------------------------
 
-jest.mock('payjoin', () => ({ payjoin: {} }));
+jest.mock('payjoin', () => ({
+  payjoin: {
+    // pass-through record factories so availableInputs can build candidates
+    TxIn: { create: jest.fn((x: unknown) => x) },
+    OutPoint: { create: jest.fn((x: unknown) => x) },
+    TxOut: { create: jest.fn((x: unknown) => x) },
+    PsbtInput: { create: jest.fn((x: unknown) => x) },
+    InputPair: jest.fn(),
+  },
+}));
 
 jest.mock('../lib/globals', () => ({
   cnClient: {
     decodeRawTransaction: jest.fn(),
     sendRawTransaction: jest.fn(),
+    lockUnspent: jest.fn(),
+    listUnspent: jest.fn(),
+    getTransaction: jest.fn(),
   },
   syncCnClient: {},
   lock: { acquire: jest.fn((_keys: unknown, fn: () => unknown) => fn()) },
@@ -21,7 +33,12 @@ jest.mock('../lib/globals', () => ({
 
 jest.mock('../lib/db', () => ({
   db: {
-    receive: { update: jest.fn().mockResolvedValue({ id: 1 }) },
+    receive: {
+      update: jest.fn().mockResolvedValue({ id: 1 }),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      findUnique: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+    },
   },
 }));
 
@@ -47,8 +64,9 @@ const { cnClient } = require('../lib/globals');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { db }       = require('../lib/db');
 
-const mockConfig: Pick<Config, 'RECEIVE_WALLET'> = {
+const mockConfig: Pick<Config, 'RECEIVE_WALLET' | 'RESERVATION_RELEASE_GRACE'> = {
   RECEIVE_WALLET: '01',
+  RESERVATION_RELEASE_GRACE: 86400,
 };
 
 const ORIGINAL_ADDRESS    = 'bc1qoriginaladdresspaidbysenderr';
@@ -75,6 +93,8 @@ function makeReceiveSess(overrides: Partial<Receive> = {}): Receive {
     receiverFee: null,
     fallbackTxHex: FALLBACK_TX_HEX,
     fallbackAbandonedTs: null,
+    reservedInputTxid: null,
+    reservedInputVout: null,
     callbackUrl: null,
     calledBackTs: null,
     expiryTs: null,
@@ -461,4 +481,401 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(updateArgs.data.amount).toBe(0n);
   });
 
+});
+
+// ---------------------------------------------------------------------------
+// reserveCommittedInput — DB claim + checked persistent wallet lock (issue #8)
+// ---------------------------------------------------------------------------
+
+describe('reserveCommittedInput', () => {
+
+  const RESERVED_TXID = 'a'.repeat(64);
+  const COMMIT_EVENT = JSON.stringify({
+    CommittedInputs: [{
+      txin: { previous_output: `${RESERVED_TXID}:1`, script_sig: '', sequence: 0, witness: [] },
+      psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
+      expected_weight: 272,
+    }],
+  });
+
+  it('claims the committed outpoint on the row and takes a checked persistent wallet lock', async () => {
+    const claimed = makeReceiveSess({ reservedInputTxid: RESERVED_TXID, reservedInputVout: 1 });
+    db.receive.update.mockResolvedValue(claimed);
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    const out = await reserveCommittedInput(makeReceiveSess(), [COMMIT_EVENT], mockConfig as Config);
+
+    expect(out).toBe(claimed);
+    expect(db.receive.update).toHaveBeenCalledWith({
+      where: { id: 1 },
+      data: { reservedInputTxid: RESERVED_TXID, reservedInputVout: 1 },
+    });
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith({
+      utxos: [{ txid: RESERVED_TXID, vout: 1 }],
+      persistent: true,
+      wallet: '01',
+    });
+    // no failure stamped
+    expect(db.receive.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('aborts before signing when the wallet lock fails, without burning the session', async () => {
+    db.receive.update.mockResolvedValue(makeReceiveSess({ reservedInputTxid: RESERVED_TXID, reservedInputVout: 1 }));
+    cnClient.lockUnspent.mockResolvedValue({ result: null, error: { code: -1, message: 'proxy unreachable' } });
+
+    const out = await reserveCommittedInput(makeReceiveSess(), [COMMIT_EVENT], mockConfig as Config);
+
+    expect(out).toBeNull();
+    // transient failure — no failedTs, session retries next cycle
+    expect(db.receive.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('aborts when the lock RPC reports success: false', async () => {
+    db.receive.update.mockResolvedValue(makeReceiveSess({ reservedInputTxid: RESERVED_TXID, reservedInputVout: 1 }));
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: false }, error: null });
+
+    const out = await reserveCommittedInput(makeReceiveSess(), [COMMIT_EVENT], mockConfig as Config);
+
+    expect(out).toBeNull();
+  });
+
+  it('treats "already locked" as ours on an idempotent re-pass holding the DB claim', async () => {
+    const sess = makeReceiveSess({ reservedInputTxid: RESERVED_TXID, reservedInputVout: 1 });
+    cnClient.lockUnspent.mockResolvedValue({
+      result: null,
+      error: { code: -8, message: 'Invalid parameter, output already locked' },
+    });
+
+    const out = await reserveCommittedInput(sess, [COMMIT_EVENT], mockConfig as Config);
+
+    expect(out).toBe(sess);
+    // claim already recorded — no second DB write
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('fails the session when another session owns the outpoint (unique-constraint conflict)', async () => {
+    db.receive.update.mockRejectedValue(Object.assign(new Error('unique constraint'), { code: 'P2002' }));
+
+    const out = await reserveCommittedInput(makeReceiveSess(), [COMMIT_EVENT], mockConfig as Config);
+
+    expect(out).toBeNull();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.updateMany).toHaveBeenCalledWith({
+      where: { id: 1, failedTs: null },
+      data: expect.objectContaining({
+        failedTs: expect.any(Date),
+        failedReason: expect.stringContaining('input_reservation_conflict'),
+      }),
+    });
+  });
+
+  it('fails the session when the committed input cannot be identified from the log', async () => {
+    const out = await reserveCommittedInput(
+      makeReceiveSess(),
+      [JSON.stringify({ Created: {} })],
+      mockConfig as Config,
+    );
+
+    expect(out).toBeNull();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.updateMany).toHaveBeenCalledWith({
+      where: { id: 1, failedTs: null },
+      data: expect.objectContaining({
+        failedReason: expect.stringContaining('cannot identify committed receiver input'),
+      }),
+    });
+  });
+
+  it('retries next cycle (no failedTs) on a transient DB error recording the claim', async () => {
+    db.receive.update.mockRejectedValue(new Error('connection refused'));
+
+    const out = await reserveCommittedInput(makeReceiveSess(), [COMMIT_EVENT], mockConfig as Config);
+
+    expect(out).toBeNull();
+    expect(db.receive.updateMany).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// releaseReservedInput — reservation lifecycle release rules (issue #8)
+// ---------------------------------------------------------------------------
+
+describe('releaseReservedInput', () => {
+
+  const RESERVED_TXID = 'b'.repeat(64);
+  const POSTED_SESSION = JSON.stringify([JSON.stringify({ PostedPayjoinProposal: [] })]);
+  const PROPOSAL_TXID = 'c'.repeat(64);
+
+  function reservedSess(overrides: Partial<Receive> = {}): Receive {
+    return makeReceiveSess({
+      reservedInputTxid: RESERVED_TXID,
+      reservedInputVout: 1,
+      ...overrides,
+    });
+  }
+
+  const UNLOCK_CALL = {
+    unlock: true,
+    persistent: true,
+    utxos: [{ txid: RESERVED_TXID, vout: 1 }],
+    wallet: '01',
+  };
+  const CLEAR_CALL = {
+    where: { id: 1 },
+    data: { reservedInputTxid: null, reservedInputVout: null },
+  };
+
+  it('unlocks and clears a cancelled session whose proposal was never posted', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({ cancelledTs: new Date() }));
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('keeps a posted, unconfirmed session reserved (mempool observation is not finality)', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: new Date(Date.now() - 1000),
+      confirmedTs: null,
+    }));
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('clears a confirmed payjoin without any unlock RPC — the input is spent', async () => {
+    // Core already removed the lock when the payjoin tx arrived; an unlock
+    // call would just fail with "expected unspent output"
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      confirmedTs: new Date(),
+    }));
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('unlocks for real when the conflicting original confirms instead of the payjoin', async () => {
+    // sender broadcast its original (recorded via the non-payjoin path) — the
+    // proposal is dead and our input is unspent, so the wallet lock must go
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: FALLBACK_TXID,
+      nonPayjoinTs: new Date(),
+      confirmedTs: new Date(),
+    }));
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('treats an externally-spent outpoint ("expected unspent output") as released', async () => {
+    // never-posted terminal session whose coin was spent by something else —
+    // the exact Core 24 message observed when unlocking a spent coin
+    db.receive.findUnique.mockResolvedValue(reservedSess({ cancelledTs: new Date() }));
+    cnClient.lockUnspent.mockResolvedValue({
+      result: null,
+      error: { code: -32603, message: 'Invalid parameter, expected unspent output' },
+    });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('retains the reservation and retries when the unlock genuinely fails', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({ cancelledTs: new Date() }));
+    cnClient.lockUnspent.mockResolvedValue({ result: null, error: { code: -1, message: 'proxy unreachable' } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps the reservation when the confirmed tx is unrelated to the posted proposal', async () => {
+    // an unrelated payment to the watched address does not invalidate the proposal
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: 'f'.repeat(64),
+      nonPayjoinTs: new Date(),
+      confirmedTs: new Date(),
+    }));
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when the row holds no reservation', async () => {
+    db.receive.findUnique.mockResolvedValue(makeReceiveSess());
+
+    await releaseReservedInput(makeReceiveSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Bounded hold: RESERVATION_RELEASE_GRACE past expiry force-releases
+  // -------------------------------------------------------------------------
+
+  const GRACE_MS = 86400 * 1000;
+
+  it('force-releases a posted, never-confirmed session once grace past expiry has elapsed', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
+      confirmedTs: null,
+    }));
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('still keeps a posted, unconfirmed session while within the grace window', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: new Date(Date.now() - GRACE_MS + 60_000),
+      confirmedTs: null,
+    }));
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('force-releases a wedged "neither payjoin nor original" session after grace', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: 'f'.repeat(64), // unrelated tx overwrote the row txid
+      nonPayjoinTs: new Date(),
+      confirmedTs: new Date(),
+      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
+    }));
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('tolerates a spent reserved input when force-releasing (payjoin confirmed but row wedged)', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: 'f'.repeat(64),
+      nonPayjoinTs: new Date(),
+      confirmedTs: new Date(),
+      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
+    }));
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
+    cnClient.lockUnspent.mockResolvedValue({
+      result: null,
+      error: { code: -32603, message: 'Invalid parameter, expected unspent output' },
+    });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('never force-releases a posted session with no expiryTs', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: null,
+      confirmedTs: null,
+    }));
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// availableInputs — DB-reserved outpoints are never offered as candidates
+// ---------------------------------------------------------------------------
+
+describe('availableInputs — reserved-outpoint filter', () => {
+
+  const TXID_A = 'a'.repeat(64);
+  const TXID_B = 'b'.repeat(64);
+
+  const utxo = (txid: string, vout: number, amount = 0.001) => ({
+    txid, vout, amount, confirmations: 3, scriptPubKey: 'aabb',
+  });
+
+  beforeEach(() => {
+    cnClient.getTransaction.mockResolvedValue({ result: { tx: {} }, error: null });
+  });
+
+  it('excludes outpoints reserved by other sessions', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0), utxo(TXID_B, 7)] }, error: null });
+    db.receive.findMany.mockResolvedValue([{ reservedInputTxid: TXID_B, reservedInputVout: 7 }]);
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].txid).toBe(TXID_A);
+    // the reserved candidate is dropped before any per-utxo RPC work
+    expect(cnClient.getTransaction).toHaveBeenCalledTimes(1);
+    expect(cnClient.getTransaction).toHaveBeenCalledWith(TXID_A);
+  });
+
+  it('only queries currently-held reservations, not historical ones', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0)] }, error: null });
+    db.receive.findMany.mockResolvedValue([]);
+
+    await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(db.receive.findMany).toHaveBeenCalledWith({
+      where: { reservedInputTxid: { not: null } },
+      select: { reservedInputTxid: true, reservedInputVout: true },
+    });
+  });
+
+  it('returns no candidates when every unspent coin is reserved', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0)] }, error: null });
+    db.receive.findMany.mockResolvedValue([{ reservedInputTxid: TXID_A, reservedInputVout: 0 }]);
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(0);
+    expect(cnClient.getTransaction).not.toHaveBeenCalled();
+  });
+
+  it('does not exclude a same-txid different-vout sibling of a reserved coin', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0), utxo(TXID_A, 1)] }, error: null });
+    db.receive.findMany.mockResolvedValue([{ reservedInputTxid: TXID_A, reservedInputVout: 0 }]);
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].vout).toBe(1);
+  });
 });

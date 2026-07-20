@@ -33,7 +33,7 @@ jest.mock('./persister', () => ({
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
-import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError } from './payjoin';
+import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal } from './payjoin';
 import { ReceiveStatus, SendStatus } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
 
@@ -58,6 +58,8 @@ function makeReceive(overrides: Partial<Receive> = {}): Receive {
     receiverFee: null,
     fallbackTxHex: null,
     fallbackAbandonedTs: null,
+    reservedInputTxid: null,
+    reservedInputVout: null,
     callbackUrl: null,
     calledBackTs: null,
     expiryTs: null,
@@ -415,5 +417,94 @@ describe('extractReplyableError', () => {
   it('tolerates already-parsed object events', () => {
     const session = JSON.stringify([{ GotReplyableError: { error_code: 'C', message: 'm' } }]);
     expect(extractReplyableError(session)).toBe('C: m');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractCommittedInputs — committed receiver input recovered from session log
+// ---------------------------------------------------------------------------
+
+describe('extractCommittedInputs', () => {
+
+  const TXID = 'a'.repeat(64);
+  const ev = (obj: unknown) => JSON.stringify(obj);
+
+  const commitEvent = (prevouts: string[]) => ev({
+    CommittedInputs: prevouts.map((previous_output) => ({
+      txin: { previous_output, script_sig: '', sequence: 0, witness: [] },
+      psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
+      expected_weight: 272,
+    })),
+  });
+
+  it('returns the outpoint from a CommittedInputs event', () => {
+    const events = [ev({ Created: {} }), commitEvent([`${TXID}:1`])];
+    expect(extractCommittedInputs(events)).toEqual([{ txid: TXID, vout: 1 }]);
+  });
+
+  it('returns undefined when inputs were never committed', () => {
+    expect(extractCommittedInputs([ev({ Created: {} })])).toBeUndefined();
+    expect(extractCommittedInputs([])).toBeUndefined();
+  });
+
+  it('returns all outpoints of a multi-input commit', () => {
+    const other = 'b'.repeat(64);
+    expect(extractCommittedInputs([commitEvent([`${TXID}:0`, `${other}:3`])]))
+      .toEqual([{ txid: TXID, vout: 0 }, { txid: other, vout: 3 }]);
+  });
+
+  it('uses the most recent CommittedInputs event', () => {
+    const other = 'c'.repeat(64);
+    const events = [commitEvent([`${TXID}:0`]), commitEvent([`${other}:2`])];
+    expect(extractCommittedInputs(events)).toEqual([{ txid: other, vout: 2 }]);
+  });
+
+  it('tolerates already-parsed object events', () => {
+    const events = [{ CommittedInputs: [{ txin: { previous_output: `${TXID}:5` } }] }];
+    expect(extractCommittedInputs(events)).toEqual([{ txid: TXID, vout: 5 }]);
+  });
+
+  it('fails loudly (undefined) on an unexpected outpoint shape', () => {
+    // struct-shaped previous_output (non-human-readable serde) must not be silently dropped
+    const events = [ev({ CommittedInputs: [{ txin: { previous_output: { txid: TXID, vout: 1 } } }] })];
+    expect(extractCommittedInputs(events)).toBeUndefined();
+    // malformed txid
+    expect(extractCommittedInputs([commitEvent(['nothex:1'])])).toBeUndefined();
+    // missing vout
+    expect(extractCommittedInputs([commitEvent([TXID])])).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sessionHasPostedProposal
+// ---------------------------------------------------------------------------
+
+describe('sessionHasPostedProposal', () => {
+  it('detects a posted proposal event regardless of JSON escaping depth', () => {
+    const session = JSON.stringify([JSON.stringify({ PostedPayjoinProposal: [] })]);
+    expect(sessionHasPostedProposal(session)).toBe(true);
+  });
+
+  it('is false for sessions that never posted', () => {
+    expect(sessionHasPostedProposal(JSON.stringify([JSON.stringify({ Created: {} })]))).toBe(false);
+    expect(sessionHasPostedProposal(null)).toBe(false);
+    expect(sessionHasPostedProposal(undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appendReceiveStatus — internal reservation fields must not leak via the API
+// ---------------------------------------------------------------------------
+
+describe('appendReceiveStatus — reservation fields are internal', () => {
+  it('omits reservedInputTxid/reservedInputVout (and session) from API responses', () => {
+    const result = appendReceiveStatus(makeReceive({
+      reservedInputTxid: 'a'.repeat(64),
+      reservedInputVout: 1,
+      session: '[]',
+    }));
+    expect(result).not.toHaveProperty('reservedInputTxid');
+    expect(result).not.toHaveProperty('reservedInputVout');
+    expect(result).not.toHaveProperty('session');
   });
 });

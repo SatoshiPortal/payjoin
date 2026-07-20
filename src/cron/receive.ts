@@ -67,6 +67,36 @@ export async function restoreReceiveSessions(config: Config) {
     failedSessions.map(receiveSess => broadcastFallback(receiveSess, config))
   );
 
+  // Recover payment from posted-but-abandoned sessions (issue #8): the sender
+  // fetched our proposal but never broadcast anything and the session has
+  // expired. Broadcast the stored fallback (the sender's signed original tx) —
+  // it claims the payment and, once confirmed, is the on-chain outcome that
+  // lets releaseReservedInput free the reserved input through its normal
+  // posted/confirmed rules. firstSeenTs null keeps us from racing a payjoin
+  // or fallback tx that is already in the mempool.
+  const allAbandonedPosted = await db.receive.findMany({
+    where: {
+      session: { contains: 'PostedPayjoinProposal' },
+      confirmedTs: null,
+      cancelledTs: null,
+      fallbackTs: null,
+      nonPayjoinTs: null,
+      firstSeenTs: null,
+      fallbackAbandonedTs: null,
+      fallbackTxHex: { not: null },
+      expiryTs: { lte: new Date() },
+    }
+  });
+  const abandonedPosted = allAbandonedPosted.filter(session => {
+    return session.id % totalReplicas === (replicaId - 1);
+  });
+  if (abandonedPosted.length > 0) {
+    logger.info(restoreReceiveSessions, `found ${abandonedPosted.length} expired posted sessions with no outcome — broadcasting fallback`);
+    await Promise.all(
+      abandonedPosted.map(receiveSess => broadcastFallback(receiveSess, config))
+    );
+  }
+
   // release receiver-input reservations held by sessions that reached a
   // terminal state (issue #8) — releaseReservedInput applies the
   // posted/confirmed safety rules per row
@@ -98,7 +128,11 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
     logger.info(processReceiveSession, 'restoring session:', receiveSess.id);
 
     if (receiveSess.txid) {
-      // @todo this should potentially check for a fallback timeout period and broadcast the fallback tx
+      // Defensive only: the restore query filters txid: null, so this just
+      // catches a callback setting txid between query and lock. Posted
+      // sessions whose payjoin never lands are handled by the abandoned-posted
+      // sweep in restoreReceiveSessions, which broadcasts the fallback after
+      // expiry (formerly a @todo here).
       logger.info(processReceiveSession, 'session already has txid:', receiveSess.txid);
       return;
     }
@@ -827,12 +861,26 @@ export async function releaseReservedInput(receiveSess: Receive, config: Config)
       let spentByPayjoin = false;
 
       const posted = sessionHasPostedProposal(fresh.session);
+      // Bounded hold (issue #8): a posted proposal normally only releases on a
+      // confirmed on-chain outcome, but that outcome may never come (sender
+      // vanished without broadcasting; row txid wedged by an unrelated
+      // payment). A generous grace period past session expiry bounds the hold:
+      // by then the abandoned-posted sweep has been broadcasting the
+      // conflicting fallback every cycle, so an outcome that was going to
+      // confirm has had ample time. If the reserved input turns out to be
+      // spent after all, the unlock below tolerates it ("expected unspent
+      // output" counts as released).
+      const graceExpired = fresh.expiryTs != null
+        && Date.now() > fresh.expiryTs.getTime() + config.RESERVATION_RELEASE_GRACE * 1000;
       if (posted) {
         if (!fresh.confirmedTs) {
-          logger.debug(releaseReservedInput, `session ${fresh.id} posted its proposal but has no confirmed outcome — keeping reservation`);
-          return;
-        }
-        if (fresh.nonPayjoinTs) {
+          if (!graceExpired) {
+            logger.debug(releaseReservedInput, `session ${fresh.id} posted its proposal but has no confirmed outcome — keeping reservation`);
+            return;
+          }
+          logger.warn(releaseReservedInput,
+            `session ${fresh.id} posted its proposal but nothing confirmed within ${config.RESERVATION_RELEASE_GRACE}s of expiry — force-releasing reservation`);
+        } else if (fresh.nonPayjoinTs) {
           // The confirmed tx is not the proposal. It is almost always the
           // sender-broadcast original (which conflicts with the proposal), but
           // an unrelated payment to the watched address takes the same code
@@ -843,9 +891,13 @@ export async function releaseReservedInput(receiveSess: Receive, config: Config)
             originalTxid = decodeResult?.tx?.txid;
           }
           if (!originalTxid || fresh.txid !== originalTxid) {
+            if (!graceExpired) {
+              logger.warn(releaseReservedInput,
+                `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original — keeping reservation`);
+              return;
+            }
             logger.warn(releaseReservedInput,
-              `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original — keeping reservation`);
-            return;
+              `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original, but reservation grace has expired — force-releasing`);
           }
         } else if (!fresh.fallbackTs) {
           // row.txid is the proposal itself (only the non-payjoin/fallback

@@ -64,8 +64,9 @@ const { cnClient } = require('../lib/globals');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { db }       = require('../lib/db');
 
-const mockConfig: Pick<Config, 'RECEIVE_WALLET'> = {
+const mockConfig: Pick<Config, 'RECEIVE_WALLET' | 'RESERVATION_RELEASE_GRACE'> = {
   RECEIVE_WALLET: '01',
+  RESERVATION_RELEASE_GRACE: 86400,
 };
 
 const ORIGINAL_ADDRESS    = 'bc1qoriginaladdresspaidbysenderr';
@@ -725,6 +726,91 @@ describe('releaseReservedInput', () => {
     db.receive.findUnique.mockResolvedValue(makeReceiveSess());
 
     await releaseReservedInput(makeReceiveSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Bounded hold: RESERVATION_RELEASE_GRACE past expiry force-releases
+  // -------------------------------------------------------------------------
+
+  const GRACE_MS = 86400 * 1000;
+
+  it('force-releases a posted, never-confirmed session once grace past expiry has elapsed', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
+      confirmedTs: null,
+    }));
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('still keeps a posted, unconfirmed session while within the grace window', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: new Date(Date.now() - GRACE_MS + 60_000),
+      confirmedTs: null,
+    }));
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('force-releases a wedged "neither payjoin nor original" session after grace', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: 'f'.repeat(64), // unrelated tx overwrote the row txid
+      nonPayjoinTs: new Date(),
+      confirmedTs: new Date(),
+      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
+    }));
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('tolerates a spent reserved input when force-releasing (payjoin confirmed but row wedged)', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: 'f'.repeat(64),
+      nonPayjoinTs: new Date(),
+      confirmedTs: new Date(),
+      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
+    }));
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
+    cnClient.lockUnspent.mockResolvedValue({
+      result: null,
+      error: { code: -32603, message: 'Invalid parameter, expected unspent output' },
+    });
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
+
+    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
+  });
+
+  it('never force-releases a posted session with no expiryTs', async () => {
+    db.receive.findUnique.mockResolvedValue(reservedSess({
+      session: POSTED_SESSION,
+      txid: PROPOSAL_TXID,
+      expiryTs: null,
+      confirmedTs: null,
+    }));
+
+    await releaseReservedInput(reservedSess(), mockConfig as Config);
 
     expect(cnClient.lockUnspent).not.toHaveBeenCalled();
     expect(db.receive.update).not.toHaveBeenCalled();

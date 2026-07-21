@@ -207,13 +207,23 @@ describe('appendReceiveStatus', () => {
     expect(appendReceiveStatus(makeReceive({ txid: 'abc', nonPayjoinTs: new Date() })).status).toBe(ReceiveStatus.NonPayjoin);
   });
 
-  it('returns Unconfirmed when txid is set (no confirmation yet)', () => {
-    expect(appendReceiveStatus(makeReceive({ txid: 'abc123' })).status).toBe(ReceiveStatus.Unconfirmed);
+  it('returns Unconfirmed when txid is set and the tx has been seen on the network', () => {
+    expect(appendReceiveStatus(makeReceive({ txid: 'abc123', firstSeenTs: new Date() })).status).toBe(ReceiveStatus.Unconfirmed);
+  });
+
+  it('returns Pending when txid is only the posted proposal and tx not yet seen', () => {
+    const future = new Date(Date.now() + 10_000);
+    expect(appendReceiveStatus(makeReceive({ txid: 'abc123', expiryTs: future })).status).toBe(ReceiveStatus.Pending);
   });
 
   it('returns Expired when expiryTs is in the past and no txid', () => {
     const past = new Date(Date.now() - 10_000);
     expect(appendReceiveStatus(makeReceive({ expiryTs: past })).status).toBe(ReceiveStatus.Expired);
+  });
+
+  it('returns Expired when the posted proposal was never seen and the session expired', () => {
+    const past = new Date(Date.now() - 10_000);
+    expect(appendReceiveStatus(makeReceive({ txid: 'abc123', expiryTs: past })).status).toBe(ReceiveStatus.Expired);
   });
 
   it('returns Pending when expiryTs is in the future and no txid', () => {

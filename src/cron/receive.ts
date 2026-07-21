@@ -1080,6 +1080,27 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
     return;
   }
 
+  // issue #6: a null firstSeenTs only proves the address-watch callback hasn't
+  // fired — ask the node directly before broadcasting the conflicting fallback.
+  // receiveSess.txid is the posted payjoin proposal txid here (the failed-session
+  // queue filters txid: null). Only a definite not-found (bitcoind -5) may
+  // proceed; any other lookup failure is an unknown outcome — retry next cycle.
+  if (receiveSess.txid) {
+    const { error: lookupError, result: lookupResult } = await cnClient.getTransaction(receiveSess.txid);
+    if (lookupResult?.txid) {
+      logger.info(broadcastFallback, `payjoin tx ${receiveSess.txid} in mempool — skipping fallback broadcast for session ${receiveSess.id}`);
+      await db.receive.update({
+        where: { id: receiveSess.id },
+        data: { firstSeenTs: receiveSess.firstSeenTs ?? new Date() },
+      }).catch((e) => logger.error(broadcastFallback, 'failed to record firstSeenTs:', e));
+      return;
+    }
+    if (lookupError?.code !== -5) {
+      logger.warn(broadcastFallback, `payjoin tx lookup failed for session ${receiveSess.id} — deferring fallback broadcast:`, lookupError);
+      return;
+    }
+  }
+
   const { error: decodeError, result: decodeResult } = await cnClient.decodeRawTransaction({ hex: receiveSess.fallbackTxHex });
   if (decodeError || !decodeResult) {
     logger.error(broadcastFallback, 'failed to decode fallback tx:', decodeError);
@@ -1110,8 +1131,10 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
     // Errors that can never clear on retry:
     //  - inputs already spent: a conflicting confirmed tx consumed the same
     //    outpoints (e.g. the winning session's fallback after a rejected probe)
+    //    — this is a genuine failure of the economic protection: this
+    //    session's fallback can never confirm, so it's logged as an error
     //  - already in chain: this exact tx is already confirmed, so the sender
-    //    beat us to the broadcast
+    //    beat us to the broadcast — benign, the payment outcome still exists
     // In both cases stop retrying: stamp fallbackAbandonedTs to drop the
     // session out of the retry queue (fallbackTxHex is kept for the record)
     // and note why. Payment accounting is never done here — only the
@@ -1123,7 +1146,8 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
       null;
 
     if (terminalReason) {
-      logger.warn(broadcastFallback, `abandoning fallback retries for session ${receiveSess.id}: ${terminalReason}`);
+      const logFn = terminalReason === 'inputs already spent' ? logger.error : logger.warn;
+      logFn(broadcastFallback, `abandoning fallback retries for session ${receiveSess.id}: ${terminalReason}`);
       await db.receive.update({
         where: { id: receiveSess.id },
         data: {

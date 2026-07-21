@@ -354,9 +354,11 @@ export function appendReceiveStatus(receive: Receive) {
     status = ReceiveStatus.Fallback;
   } else if (receive.nonPayjoinTs) {
     status = ReceiveStatus.NonPayjoin;
-  } else if (receive.txid) {
+  } else if (receive.txid && receive.firstSeenTs) {
+    // txid alone is only the posted proposal (issue #6) — report unconfirmed
+    // once the tx has actually been observed on the network
     status = ReceiveStatus.Unconfirmed;
-  } else if (!receive.txid && !receive.confirmedTs && receive.expiryTs && receive.expiryTs < new Date()) {
+  } else if (!receive.firstSeenTs && !receive.confirmedTs && receive.expiryTs && receive.expiryTs < new Date()) {
     status = ReceiveStatus.Expired;
   }
 

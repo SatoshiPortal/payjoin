@@ -423,6 +423,53 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
+  it('checks the node for the posted proposal before broadcasting', async () => {
+    const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
+    // definite not-found — the only lookup outcome that may broadcast
+    cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -5, message: 'No such mempool or blockchain transaction' } });
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+
+    await broadcastFallback(makeReceiveSess({ txid: PROPOSAL_TXID }), mockConfig as Config);
+
+    expect(cnClient.getTransaction).toHaveBeenCalledWith(PROPOSAL_TXID);
+    expect(cnClient.sendRawTransaction).toHaveBeenCalled();
+    expect(db.receive.update.mock.calls[0][0].data.txid).toBe(FALLBACK_TXID);
+  });
+
+  it('skips the broadcast and stamps firstSeenTs when the payjoin tx is known to the node', async () => {
+    const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
+    cnClient.getTransaction.mockResolvedValue({ result: { txid: PROPOSAL_TXID, confirmations: 0 } });
+
+    await broadcastFallback(makeReceiveSess({ txid: PROPOSAL_TXID }), mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    const updateArgs = db.receive.update.mock.calls[0][0];
+    expect(updateArgs.data.firstSeenTs).toBeInstanceOf(Date);
+    // observation is recorded, but payment accounting stays with the address watch
+    expect(updateArgs.data).not.toHaveProperty('fallbackTs');
+    expect(updateArgs.data).not.toHaveProperty('amount');
+  });
+
+  it('defers the broadcast when the node lookup fails (unknown outcome, not "not found")', async () => {
+    const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
+    // transport/gatekeeper failure surfaces as a generic InternalError, not -5
+    cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -32603, message: 'connect ECONNREFUSED' } });
+
+    await broadcastFallback(makeReceiveSess({ txid: PROPOSAL_TXID }), mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(db.receive.update).not.toHaveBeenCalled();
+  });
+
+  it('does not consult the node when no proposal was ever posted (txid null)', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+
+    await broadcastFallback(makeReceiveSess({ txid: null }), mockConfig as Config);
+
+    expect(cnClient.getTransaction).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).toHaveBeenCalled();
+  });
+
   it('uses receiveSess.address when bip21 is null', async () => {
     cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
 

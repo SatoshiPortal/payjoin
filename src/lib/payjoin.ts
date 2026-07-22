@@ -320,6 +320,14 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
     throw new Error(`Failed to create funded psbt: ${psbtError}`);
   }
 
+  // record what lockUnspents:true just locked, before anything else here can throw
+  const { error: decodeError, result: decodeResult } = await cnClient.decodePsbt({ psbt: psbtResult.psbt });
+  if (decodeError || !decodeResult) {
+    throw new Error(`Failed to decode funded psbt: ${decodeError}`);
+  }
+  const lockedInputs = decodeResult.tx.vin.map((vin) => ({ txid: vin.txid, vout: vin.vout }));
+  await db.send.update({ where: { id: Number(id) }, data: { lockedInputs } });
+
   const { error: processedPsbtError, result: processedPsbtResult } = await cnClient.processPsbt({
     psbt: psbtResult.psbt,
     sign: true,

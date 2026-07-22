@@ -2,7 +2,7 @@ import { payjoin } from "payjoin";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
 import { Config } from "../config";
-import { Send } from "@prisma/client";
+import { Prisma, Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { extractFeeFromPsbt, fetchBufferResponse, randomRelay, withRelayFallback } from "../lib/payjoin";
@@ -32,6 +32,32 @@ export async function restoreSendSessions(config: Config) {
   await Promise.all(
     sessions.map(sendSess => processSendSession(sendSess, config))
   );
+
+  // Release lockUnspents:true inputs (createSender()) for terminal, unbroadcast
+  // sends — only the outpoints recorded on each row.
+  // Expiry alone gets RESERVATION_RELEASE_GRACE first: the original may still
+  // be a counterparty's fallback tx in flight.
+  const graceExpiredBefore = new Date(Date.now() - config.RESERVATION_RELEASE_GRACE * 1000);
+  const stuckSends = await db.send.findMany({
+    where: {
+      txid: null,
+      lockedInputs: { not: Prisma.DbNull },
+      OR: [{ cancelledTs: { not: null } }, { expiryTs: { lte: graceExpiredBefore } }],
+    },
+    select: { id: true, lockedInputs: true },
+  });
+  for (const stuck of stuckSends) {
+    const utxos = stuck.lockedInputs as unknown as { txid: string; vout: number }[];
+    if (!Array.isArray(utxos) || utxos.length === 0) continue;
+
+    const { error } = await cnClient.lockUnspent({ unlock: true, utxos, wallet: config.SEND_WALLET });
+    if (error) {
+      logger.error(restoreSendSessions, `failed to release locked inputs for send ${stuck.id} — retrying next cycle:`, error);
+      continue;
+    }
+    await db.send.update({ where: { id: stuck.id }, data: { lockedInputs: Prisma.DbNull } });
+    logger.info(restoreSendSessions, `released ${utxos.length} locked input(s) for terminal send ${stuck.id}`);
+  }
 }
 
 export async function processSendSession(sendSess: Send, config: Config) {

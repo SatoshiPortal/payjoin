@@ -44,3 +44,35 @@ describe('Utils.btcToSats — float rounding', () => {
   });
 
 });
+
+describe('Utils.jsonStringify — Error serialization', () => {
+
+  it('preserves message/name/stack for a plain Error (normally non-enumerable, so JSON.stringify alone gives {})', () => {
+    const err = new Error('boom');
+    const parsed = JSON.parse(Utils.jsonStringify(err));
+    expect(parsed.message).toBe('boom');
+    expect(parsed.name).toBe('Error');
+    expect(typeof parsed.stack).toBe('string');
+  });
+
+  it('still captures a custom subclass\'s own enumerable fields alongside message/stack', () => {
+    class CustomError extends Error {
+      code: number;
+      constructor(message: string, code: number) {
+        super(message);
+        this.name = 'CustomError';
+        this.code = code;
+      }
+    }
+    const parsed = JSON.parse(Utils.jsonStringify(new CustomError('bad request', 400)));
+    expect(parsed.message).toBe('bad request');
+    expect(parsed.name).toBe('CustomError');
+    expect(parsed.code).toBe(400);
+  });
+
+  it('leaves non-Error objects going through the existing recursive branch untouched', () => {
+    const parsed = JSON.parse(Utils.jsonStringify({ a: 1n, b: [1, 2n], c: { d: 'x' } }));
+    expect(parsed).toEqual({ a: '1', b: [1, '2'], c: { d: 'x' } });
+  });
+
+});

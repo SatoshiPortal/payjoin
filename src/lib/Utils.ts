@@ -110,6 +110,16 @@ class Utils {
       return value.toString();
     } else if (Array.isArray(value)) {
       return value.map((v: any) => Utils.jsonReplacer(key, v));
+    } else if (value instanceof Error) {
+      // message/stack/name are non-enumerable, so Object.entries() below alone gives {}
+      return {
+        name: value.name,
+        message: value.message,
+        stack: value.stack,
+        ...Object.fromEntries(
+          Object.entries(value).map(([key, val]) => [key, Utils.jsonReplacer(key, val)]),
+        ),
+      };
     } else if (typeof value === "object" && value !== null && !(value instanceof Date)) {
       return Object.fromEntries(
         Object.entries(value).map(([key, val]) => [key, Utils.jsonReplacer(key, val)]),

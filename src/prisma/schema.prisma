@@ -23,6 +23,7 @@ model Send {
   receiverOutAmount BigInt?       @map("receiver_output_amount")
   txInputs          Json?         @map("tx_inputs")
   txOutputs         Json?         @map("tx_outputs")
+  lockedInputs      Json?         @map("locked_inputs")
   txid              String?
   address           String?
   fee               BigInt?

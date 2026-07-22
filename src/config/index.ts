@@ -19,7 +19,7 @@ export interface Config {
   OHTTP_LONGPOLL_TIMEOUT_MS: number; // timeout for directory long-poll requests; should exceed the directory's ~30s long-poll window
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
   MAX_PAYJOIN_FEE_RATE: number; // sat/vbyte — reject payjoin proposals whose fee rate exceeds this ceiling
-  RESERVATION_RELEASE_GRACE: number; // seconds past expiryTs after which a posted-but-unconfirmed session's input reservation is force-released
+  RESERVATION_RELEASE_GRACE: number; // seconds past expiryTs before a receive reservation or send lock is force-released
 }
 
 export let config: Config = {
@@ -39,7 +39,7 @@ export let config: Config = {
   OHTTP_LONGPOLL_TIMEOUT_MS: Number(process.env.OHTTP_LONGPOLL_TIMEOUT_MS || 35000),
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
   MAX_PAYJOIN_FEE_RATE: Number(process.env.MAX_PAYJOIN_FEE_RATE || 500), // 500 sat/vbyte default
-  RESERVATION_RELEASE_GRACE: Number(process.env.RESERVATION_RELEASE_GRACE || 7200), // 2h default — enough for the recovery fallback (not fee-bumpable) to confirm through the normal path under congestion
+  RESERVATION_RELEASE_GRACE: Number(process.env.RESERVATION_RELEASE_GRACE || 1800), // 30m default — enough for the recovery fallback (not fee-bumpable) to confirm through the normal path under congestion
 };
 
 export function reloadConfig(): Config {

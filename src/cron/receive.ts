@@ -962,6 +962,41 @@ export async function availableInputs(config: Config, targetSats: bigint): Promi
     logger.debug(availableInputs, 'excluding reserved outpoints:', [...reserved]);
   }
 
+  const eligibleUtxos = utxosResult.utxos.filter((utxo) =>
+    utxo.confirmations > 0 &&
+    Utils.btcToSats(utxo.amount) > 0n &&
+    !reserved.has(outpointKey(utxo)));
+
+  // Anti-snowball (issue #9): a coin whose parent tx is a receiver output we
+  // ourselves generated for an earlier Payjoin proposal would let that output
+  // be consumed straight into the next proposal, chaining R0->R1->R2 in a
+  // recognizable "snowball" fingerprint. Receive.txid already records a
+  // session's own generated proposal txid (set once the sender acks the
+  // POST); fallbackTs/nonPayjoinTs mark the rows where that field instead
+  // holds a fallback or unrelated-payment txid, so excluding those keeps an
+  // ordinary spend of a Payjoin output eligible again once it lands in a new
+  // (non-Payjoin) parent. Because listunspent only returns confirmed coins,
+  // a match here proves that proposal reached the active chain even if this
+  // service's own confirmedTs bookkeeping for it lagged or was missed.
+  const candidateParentTxids = [...new Set(eligibleUtxos.map((utxo) => utxo.txid))];
+  const blockedParentTxids = new Set<string>();
+  if (candidateParentTxids.length > 0) {
+    try {
+      const priorProposalRows = await db.receive.findMany({
+        where: { txid: { in: candidateParentTxids }, fallbackTs: null, nonPayjoinTs: null },
+        select: { txid: true },
+      });
+      priorProposalRows.forEach((r) => blockedParentTxids.add(r.txid!));
+    } catch (e) {
+      // fail closed: never fall back to unfiltered candidates on a DB error
+      logger.error(availableInputs, 'failed to check prior-proposal ancestry — failing closed:', e);
+      return [];
+    }
+    if (blockedParentTxids.size > 0) {
+      logger.debug(availableInputs, 'excluding utxos with a prior Payjoin-proposal parent:', [...blockedParentTxids]);
+    }
+  }
+
   // Order candidates by how close their value is to the payment amount, closest first.
   //
   // The PDK's tryPreservingPrivacy() returns the FIRST candidate that avoids the
@@ -973,11 +1008,8 @@ export async function availableInputs(config: Config, targetSats: bigint): Promi
   // of payment + fee + change), so amount-magnitude clustering can't single it out as the
   // receiver's.
   const abs = (n: bigint): bigint => (n < 0n ? -n : n);
-  const sortedUtxos = [...utxosResult.utxos]
-    .filter((utxo) =>
-      utxo.confirmations > 0 &&
-      Utils.btcToSats(utxo.amount) > 0n &&
-      !reserved.has(outpointKey(utxo)))
+  const sortedUtxos = eligibleUtxos
+    .filter((utxo) => !blockedParentTxids.has(utxo.txid))
     .sort((a, b) => {
       const da = abs(Utils.btcToSats(a.amount) - targetSats);
       const db = abs(Utils.btcToSats(b.amount) - targetSats);

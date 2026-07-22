@@ -2,18 +2,34 @@
 // Module mocks — prevent side-effectful imports from failing in test env
 // ---------------------------------------------------------------------------
 
-jest.mock('payjoin', () => ({ payjoin: {} }));
+jest.mock('payjoin', () => ({
+  payjoin: {
+    // createSender() does `new payjoin.SenderBuilder(psbt, pjUri).buildRecommended(1n).save(persister)`
+    SenderBuilder: jest.fn().mockImplementation(() => ({
+      buildRecommended: jest.fn().mockReturnThis(),
+      save: jest.fn(),
+    })),
+  },
+}));
 jest.mock('axios', () => ({ default: { get: jest.fn(), post: jest.fn(), request: jest.fn() }, isAxiosError: jest.fn() }));
 jest.mock('https-proxy-agent', () => ({ HttpsProxyAgent: jest.fn() }));
 
 jest.mock('./globals', () => ({
-  cnClient: {},
+  cnClient: {
+    getFeeRate: jest.fn(),
+    getblockchaininfo: jest.fn(),
+    createFundedPsbt: jest.fn(),
+    decodePsbt: jest.fn(),
+    processPsbt: jest.fn(),
+  },
   syncCnClient: {},
   lock: {},
 }));
 
 jest.mock('./db', () => ({
-  db: {},
+  db: {
+    send: { update: jest.fn().mockResolvedValue({}) },
+  },
 }));
 
 jest.mock('./Log2File', () => ({
@@ -33,9 +49,14 @@ jest.mock('./persister', () => ({
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
-import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal } from './payjoin';
+import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal, createSender } from './payjoin';
 import { ReceiveStatus, SendStatus } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { cnClient } = require('./globals');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { db } = require('./db');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -89,6 +110,7 @@ function makeSend(overrides: Partial<Send> = {}): Send {
     receiverOutAmount: null,
     txInputs: null,
     txOutputs: null,
+    lockedInputs: null,
     txid: null,
     address: 'bc1qtest',
     fee: null,
@@ -516,5 +538,83 @@ describe('appendReceiveStatus — reservation fields are internal', () => {
     expect(result).not.toHaveProperty('reservedInputTxid');
     expect(result).not.toHaveProperty('reservedInputVout');
     expect(result).not.toHaveProperty('session');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createSender — locked inputs recorded so restoreSendSessions can release
+// them precisely later (no matching release existed at all previously)
+// ---------------------------------------------------------------------------
+
+describe('createSender — records exactly which outpoints lockUnspents:true locked', () => {
+
+  const FUNDED_PSBT = 'cHNidP8BAH0...funded';
+  const LOCKED_VIN = [
+    { txid: 'a'.repeat(64), vout: 0, scriptSig: { asm: '', hex: '' }, txinwitness: [], sequence: 0 },
+    { txid: 'b'.repeat(64), vout: 2, scriptSig: { asm: '', hex: '' }, txinwitness: [], sequence: 0 },
+  ];
+
+  function rawTxWithVin(vin: typeof LOCKED_VIN) {
+    return {
+      txid: 'c'.repeat(64), hash: 'c'.repeat(64), version: 2, size: 200, vsize: 200,
+      weight: 800, locktime: 0, vin, vout: [],
+    };
+  }
+
+  function setupHappyPath() {
+    cnClient.getFeeRate.mockResolvedValue({ result: { feerate: 5 }, error: null });
+    cnClient.getblockchaininfo.mockResolvedValue({ result: { blocks: 100 }, error: null });
+    cnClient.createFundedPsbt.mockResolvedValue({ result: { psbt: FUNDED_PSBT, fee: 0.00001, changepos: 1 }, error: null });
+    cnClient.decodePsbt.mockResolvedValue({ result: { inputs: [], outputs: [], tx: rawTxWithVin(LOCKED_VIN) }, error: null });
+    cnClient.processPsbt.mockResolvedValue({ result: { psbt: 'signed', complete: true }, error: null });
+  }
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('records the funded psbt\'s exact input outpoints as lockedInputs before signing', async () => {
+    setupHappyPath();
+
+    await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
+
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 7 },
+      data: { lockedInputs: [{ txid: 'a'.repeat(64), vout: 0 }, { txid: 'b'.repeat(64), vout: 2 }] },
+    });
+  });
+
+  it('records lockedInputs before processPsbt runs (locked coins are known the moment createFundedPsbt returns)', async () => {
+    setupHappyPath();
+    const callOrder: string[] = [];
+    db.send.update.mockImplementation(async () => { callOrder.push('db.send.update'); return {}; });
+    cnClient.processPsbt.mockImplementation(async () => {
+      callOrder.push('processPsbt');
+      return { result: { psbt: 'signed', complete: true }, error: null };
+    });
+
+    await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
+
+    expect(callOrder).toEqual(['db.send.update', 'processPsbt']);
+  });
+
+  it('throws and never records lockedInputs when createFundedPsbt itself fails (nothing was locked)', async () => {
+    cnClient.getFeeRate.mockResolvedValue({ result: { feerate: 5 }, error: null });
+    cnClient.getblockchaininfo.mockResolvedValue({ result: { blocks: 100 }, error: null });
+    cnClient.createFundedPsbt.mockResolvedValue({ result: null, error: { code: -4, message: 'Insufficient funds' } });
+
+    await expect(createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' }))
+      .rejects.toThrow('Failed to create funded psbt');
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('throws without recording lockedInputs when decoding the just-funded psbt fails', async () => {
+    cnClient.getFeeRate.mockResolvedValue({ result: { feerate: 5 }, error: null });
+    cnClient.getblockchaininfo.mockResolvedValue({ result: { blocks: 100 }, error: null });
+    cnClient.createFundedPsbt.mockResolvedValue({ result: { psbt: FUNDED_PSBT, fee: 0.00001, changepos: 1 }, error: null });
+    cnClient.decodePsbt.mockResolvedValue({ result: null, error: { code: -1, message: 'decode failed' } });
+
+    await expect(createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' }))
+      .rejects.toThrow('Failed to decode funded psbt');
+    expect(db.send.update).not.toHaveBeenCalled();
+    expect(cnClient.processPsbt).not.toHaveBeenCalled();
   });
 });

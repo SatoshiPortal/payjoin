@@ -1,5 +1,6 @@
-import { validateAndBroadcastPayjoinPsbt } from './send';
+import { validateAndBroadcastPayjoinPsbt, restoreSendSessions } from './send';
 import { Config } from '../config';
+import { Prisma } from '@prisma/client';
 
 // ---------------------------------------------------------------------------
 // Module mocks
@@ -16,6 +17,7 @@ jest.mock('../lib/globals', () => ({
     finalizePsbt: jest.fn(),
     sendRawTransaction: jest.fn(),
     decodePsbt: jest.fn(),
+    lockUnspent: jest.fn(),
   },
   syncCnClient: {
     syncGetAddressInfo: jest.fn().mockReturnValue({ result: { ismine: false }, error: null }),
@@ -25,7 +27,10 @@ jest.mock('../lib/globals', () => ({
 
 jest.mock('../lib/db', () => ({
   db: {
-    send: { update: jest.fn().mockResolvedValue({}) },
+    send: {
+      update: jest.fn().mockResolvedValue({}),
+      findMany: jest.fn().mockResolvedValue([]),
+    },
   },
 }));
 
@@ -46,10 +51,11 @@ const { cnClient } = require('../lib/globals');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { db } = require('../lib/db');
 
-const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE'> = {
+const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE'> = {
   SEND_WALLET: '01',
   OHTTP_RELAYS: ['https://relay.example.com'],
   MAX_PAYJOIN_FEE_RATE: 500, // sat/vbyte — reject anything above this in tests
+  RESERVATION_RELEASE_GRACE: 1800, // 30m
 };
 
 const mockSendSess = { id: 1, amount: 100_000n }; // 100k sat payment
@@ -261,6 +267,133 @@ describe('validateAndBroadcastPayjoinPsbt — success accounting', () => {
 
     await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
 
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreSendSessions — precise release of send-side wallet locks
+//
+// createFundedPsbt's lockUnspents:true has no matching release anywhere else
+// (unlike the receive side's issue #8 mechanism). These tests cover the
+// targeted release: exactly the outpoints recorded on a terminal (cancelled
+// or expired), never-broadcast row — never a blanket wallet-wide unlock.
+// ---------------------------------------------------------------------------
+
+describe('restoreSendSessions — precise release of stuck locked inputs', () => {
+
+  const LOCKED = [{ txid: 'a'.repeat(64), vout: 0 }, { txid: 'b'.repeat(64), vout: 1 }];
+
+  // first findMany call = active sessions to restore (always empty here, so
+  // processSendSession/the payjoin SDK is never touched); second call = the
+  // stuck-sends release query.
+  function mockStuckSends(rows: Array<{ id: number; lockedInputs: unknown }>) {
+    db.send.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(rows);
+  }
+
+  it('scopes the release query to unbroadcast, terminal rows with recorded locked inputs', async () => {
+    mockStuckSends([]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(db.send.findMany).toHaveBeenLastCalledWith({
+      where: {
+        txid: null,
+        lockedInputs: { not: Prisma.DbNull },
+        OR: [{ cancelledTs: { not: null } }, { expiryTs: { lte: expect.any(Date) } }],
+      },
+      select: { id: true, lockedInputs: true },
+    });
+  });
+
+  it('only treats a send as expired-and-releasable once RESERVATION_RELEASE_GRACE has passed since expiry — cancellation still releases immediately with no grace', async () => {
+    mockStuckSends([]);
+    const before = Date.now();
+
+    await restoreSendSessions(mockConfig as Config);
+
+    const { where } = db.send.findMany.mock.calls[db.send.findMany.mock.calls.length - 1][0];
+    const [cancelledClause, expiryClause] = where.OR;
+    expect(cancelledClause).toEqual({ cancelledTs: { not: null } });
+
+    // the expiry cutoff must be ~RESERVATION_RELEASE_GRACE seconds in the past
+    // (not "now") — an expired session within the grace window must NOT match
+    const cutoff = expiryClause.expiryTs.lte.getTime();
+    const expectedCutoff = before - mockConfig.RESERVATION_RELEASE_GRACE * 1000;
+    expect(Math.abs(cutoff - expectedCutoff)).toBeLessThan(2000); // small tolerance for test execution time
+  });
+
+  it('releases exactly the recorded outpoints for a stuck send, then clears lockedInputs', async () => {
+    mockStuckSends([{ id: 42, lockedInputs: LOCKED }]);
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith({
+      unlock: true,
+      utxos: LOCKED,
+      wallet: mockConfig.SEND_WALLET,
+    });
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { lockedInputs: Prisma.DbNull },
+    });
+  });
+
+  it('never issues a blanket unlock — always passes the specific utxos array', async () => {
+    mockStuckSends([{ id: 42, lockedInputs: LOCKED }]);
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    const call = cnClient.lockUnspent.mock.calls[0][0];
+    expect(call.utxos).not.toEqual([]);
+    expect(call.utxos.length).toBeGreaterThan(0);
+  });
+
+  it('retries next cycle without clearing lockedInputs when lockUnspent fails', async () => {
+    mockStuckSends([{ id: 42, lockedInputs: LOCKED }]);
+    cnClient.lockUnspent.mockResolvedValue({ result: null, error: { code: -1, message: 'rpc error' } });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('releases multiple stuck sends independently, each with its own outpoints', async () => {
+    const otherLocked = [{ txid: 'c'.repeat(64), vout: 3 }];
+    mockStuckSends([
+      { id: 42, lockedInputs: LOCKED },
+      { id: 43, lockedInputs: otherLocked },
+    ]);
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledTimes(2);
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ utxos: LOCKED }));
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ utxos: otherLocked }));
+    expect(db.send.update).toHaveBeenCalledWith({ where: { id: 42 }, data: { lockedInputs: Prisma.DbNull } });
+    expect(db.send.update).toHaveBeenCalledWith({ where: { id: 43 }, data: { lockedInputs: Prisma.DbNull } });
+  });
+
+  it('skips a row with no locked inputs recorded (malformed/empty) without calling lockUnspent', async () => {
+    mockStuckSends([{ id: 42, lockedInputs: [] }]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when there are no stuck sends', async () => {
+    mockStuckSends([]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
     expect(db.send.update).not.toHaveBeenCalled();
   });
 });

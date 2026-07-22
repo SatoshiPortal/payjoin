@@ -926,3 +926,110 @@ describe('availableInputs — reserved-outpoint filter', () => {
     expect(inputs[0].vout).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// availableInputs — anti-snowball ancestry filter (issue #9)
+// ---------------------------------------------------------------------------
+
+describe('availableInputs — prior-Payjoin-proposal ancestry filter', () => {
+
+  const TXID_A = 'a'.repeat(64);
+  const TXID_B = 'b'.repeat(64);
+
+  const utxo = (txid: string, vout: number, amount = 0.001) => ({
+    txid, vout, amount, confirmations: 3, scriptPubKey: 'aabb',
+  });
+
+  beforeEach(() => {
+    cnClient.getTransaction.mockResolvedValue({ result: { tx: {} }, error: null });
+  });
+
+  it('excludes a candidate whose parent txid is a prior generated proposal', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0), utxo(TXID_B, 0)] }, error: null });
+    // first call: no reservations held; second call: TXID_A is a prior Payjoin proposal
+    db.receive.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ txid: TXID_A }]);
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].txid).toBe(TXID_B);
+    expect(db.receive.findMany).toHaveBeenLastCalledWith({
+      where: { txid: { in: [TXID_A, TXID_B] }, fallbackTs: null, nonPayjoinTs: null },
+      select: { txid: true },
+    });
+  });
+
+  it('scopes the ancestry lookup to exclude fallback and non-Payjoin rows, so their txid never taints a parent', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0)] }, error: null });
+    db.receive.findMany
+      .mockResolvedValueOnce([]) // no reservations
+      .mockResolvedValueOnce([]); // a real DB applying the where-clause below excludes fallback/non-Payjoin rows
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].txid).toBe(TXID_A);
+    expect(db.receive.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ fallbackTs: null, nonPayjoinTs: null }) })
+    );
+  });
+
+  it('does not apply recursive ancestry taint to an intervening ordinary spend', async () => {
+    // TXID_B is an ordinary wallet spend that consumed a prior Payjoin output; its own
+    // change (this candidate) must remain eligible even though its grandparent was tainted.
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_B, 0)] }, error: null });
+    db.receive.findMany
+      .mockResolvedValueOnce([]) // no reservations
+      .mockResolvedValueOnce([]); // TXID_B itself was never a generated proposal
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].txid).toBe(TXID_B);
+  });
+
+  it('excludes every wallet-owned output sharing a tainted parent', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0), utxo(TXID_A, 1)] }, error: null });
+    db.receive.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ txid: TXID_A }]);
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(0);
+  });
+
+  it('returns no candidates when every eligible coin is tainted (falls through to no-input/fallback lifecycle)', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0)] }, error: null });
+    db.receive.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ txid: TXID_A }]);
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(0);
+    expect(cnClient.getTransaction).not.toHaveBeenCalled();
+  });
+
+  it('fails closed — a database error checking ancestry yields no candidates', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0)] }, error: null });
+    db.receive.findMany
+      .mockResolvedValueOnce([]) // reservation lookup succeeds
+      .mockRejectedValueOnce(new Error('connection lost')); // ancestry lookup fails
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(0);
+    expect(cnClient.getTransaction).not.toHaveBeenCalled();
+  });
+
+  it('skips the ancestry query entirely when there are no eligible candidates', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [] }, error: null });
+
+    await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(db.receive.findMany).toHaveBeenCalledTimes(1); // only the reservation lookup
+  });
+});

@@ -6,7 +6,7 @@ import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, randomRelay, recordRelayFailure, sessionHasPostedProposal } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, hexToArrayBuffer, randomRelay, recordRelayFailure, sessionHasPostedProposal } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 import { claimSeenInputsForSession, outpointKey, SeenInputConflictError, SeenOutpoint } from "../lib/seenInputs";
@@ -363,7 +363,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
               if (addrInfoError || !addrInfoResult?.scriptPubKey) {
                 throw new Error(`Failed to get scriptPubKey for address: ${addrResult.address}`);
               }
-              const freshScript = new Uint8Array(Buffer.from(addrInfoResult.scriptPubKey, 'hex')).buffer;
+              const freshScript = hexToArrayBuffer(addrInfoResult.scriptPubKey);
               receiver = receiver.substituteReceiverScript(freshScript).commitOutputs().save(persister);
               effectiveReceiverAddress = addrResult.address;
               logger.info(processReceiveSession, 'substituted receiver output to fresh address:', addrResult.address);
@@ -1026,35 +1026,41 @@ export async function availableInputs(config: Config, targetSats: bigint): Promi
     }
     logger.debug(availableInputs, 'got transaction for utxo:', txResult);
 
-    const txin = payjoin.TxIn.create({
-      previousOutput: payjoin.OutPoint.create({
+    try {
+      const txin = payjoin.TxIn.create({
+        previousOutput: payjoin.OutPoint.create({
+          txid: utxo.txid,
+          vout: utxo.vout,
+        }),
+        scriptSig: new Uint8Array([]).buffer,
+        sequence: 0,
+        witness: [],
+      });
+
+      const txOut = payjoin.TxOut.create({
+        valueSat: Utils.btcToSats(utxo.amount),
+        scriptPubkey: hexToArrayBuffer(utxo.scriptPubKey),
+      });
+
+      const psbtIn = payjoin.PsbtInput.create({
+          witnessUtxo: txOut,
+          redeemScript: utxo.redeemScript ? hexToArrayBuffer(utxo.redeemScript) : undefined,
+          witnessScript: utxo.witnessScript ? hexToArrayBuffer(utxo.witnessScript) : undefined,
+      });
+      logger.debug(availableInputs, 'created input pair for utxo:', txin, psbtIn);
+
+      inputs.push({
+        inputPair: new payjoin.InputPair(txin, psbtIn, undefined),
         txid: utxo.txid,
         vout: utxo.vout,
-      }),
-      scriptSig: new Uint8Array([]).buffer,
-      sequence: 0,
-      witness: [],
-    });
-
-    const txOut = payjoin.TxOut.create({
-      valueSat: Utils.btcToSats(utxo.amount),
-      scriptPubkey: new Uint8Array(Buffer.from(utxo.scriptPubKey, "hex")).buffer,
-    });
-    const psbtIn = payjoin.PsbtInput.create({
-        witnessUtxo: txOut,
-        redeemScript: undefined,
-        witnessScript: undefined,
-    });
-    logger.debug(availableInputs, 'created input pair for utxo:', txin, psbtIn);
-
-    inputs.push({
-      inputPair: new payjoin.InputPair(txin, psbtIn, undefined),
-      txid: utxo.txid,
-      vout: utxo.vout,
-      amount: utxo.amount,
-      scriptPubKey: utxo.scriptPubKey,
-    });
-    logger.debug(availableInputs, 'added input pair for utxo:', utxo.txid, utxo.vout);
+        amount: utxo.amount,
+        scriptPubKey: utxo.scriptPubKey,
+      });
+      logger.debug(availableInputs, 'added input pair for utxo:', utxo.txid, utxo.vout);
+    } catch (e) {
+      logger.debug(availableInputs, 'excluding utxo — could not build a spendable InputPair:', utxo.txid, utxo.vout, describePayjoinError(e));
+      continue;
+    }
 
     // limit to 20 inputs to provide to payjoin library
     if (inputs.length >= 20) {

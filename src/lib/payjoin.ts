@@ -105,6 +105,10 @@ export function arrayBufferToHex(buffer: ArrayBuffer): string {
     return hexCodes.join('');
 }
 
+export function hexToArrayBuffer(hex: string): ArrayBuffer {
+    return new Uint8Array(Buffer.from(hex, 'hex')).buffer;
+}
+
 /**
  * Extract a useful, human-readable message from an error thrown by the payjoin
  * WASM/FFI bindings.

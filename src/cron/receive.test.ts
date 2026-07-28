@@ -63,6 +63,8 @@ jest.mock('../lib/Log2File', () => ({
 const { cnClient } = require('../lib/globals');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { db }       = require('../lib/db');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { payjoin }  = require('payjoin');
 
 const mockConfig: Pick<Config, 'RECEIVE_WALLET' | 'RESERVATION_RELEASE_GRACE'> = {
   RECEIVE_WALLET: '01',
@@ -1031,5 +1033,82 @@ describe('availableInputs — prior-Payjoin-proposal ancestry filter', () => {
     await availableInputs(mockConfig as Config, 100_000n);
 
     expect(db.receive.findMany).toHaveBeenCalledTimes(1); // only the reservation lookup
+  });
+});
+
+// ---------------------------------------------------------------------------
+// availableInputs — P2SH/P2WSH-family candidates: redeem/witness script
+// pass-through, and per-candidate isolation on InputPair construction failure
+// (the "one bad coin crashes every payjoin" bug — see 20260727 payjoin-1.log)
+// ---------------------------------------------------------------------------
+
+describe('availableInputs — redeem/witness script pass-through and per-candidate isolation', () => {
+
+  const TXID_A = 'a'.repeat(64);
+  const TXID_B = 'b'.repeat(64);
+  const TXID_C = 'c'.repeat(64);
+
+  const utxo = (txid: string, vout: number, extra: Partial<{ redeemScript: string; witnessScript: string }> = {}) => ({
+    txid, vout, amount: 0.001, confirmations: 3, scriptPubKey: 'aabb', ...extra,
+  });
+
+  beforeEach(() => {
+    cnClient.getTransaction.mockResolvedValue({ result: { tx: {} }, error: null });
+    db.receive.findMany.mockResolvedValue([]);
+  });
+
+  it('passes a redeemScript through to PsbtInput.create instead of always nulling it out', async () => {
+    const redeemScriptHex = '0014' + 'aa'.repeat(20);
+    cnClient.listUnspent.mockResolvedValue({
+      result: { utxos: [utxo(TXID_A, 0, { redeemScript: redeemScriptHex })] },
+      error: null,
+    });
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    const psbtInCall = payjoin.PsbtInput.create.mock.calls[0][0];
+    expect(psbtInCall.redeemScript).toBeInstanceOf(ArrayBuffer);
+    expect(Buffer.from(psbtInCall.redeemScript).toString('hex')).toBe(redeemScriptHex);
+  });
+
+  it('passes a witnessScript through to PsbtInput.create instead of always nulling it out', async () => {
+    const witnessScriptHex = '51' + 'bb'.repeat(33) + '51ae';
+    cnClient.listUnspent.mockResolvedValue({
+      result: { utxos: [utxo(TXID_A, 0, { witnessScript: witnessScriptHex })] },
+      error: null,
+    });
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs).toHaveLength(1);
+    const psbtInCall = payjoin.PsbtInput.create.mock.calls[0][0];
+    expect(psbtInCall.witnessScript).toBeInstanceOf(ArrayBuffer);
+    expect(Buffer.from(psbtInCall.witnessScript).toString('hex')).toBe(witnessScriptHex);
+  });
+
+  it('still passes undefined redeem/witness scripts for a plain candidate (no regression)', async () => {
+    cnClient.listUnspent.mockResolvedValue({ result: { utxos: [utxo(TXID_A, 0)] }, error: null });
+
+    await availableInputs(mockConfig as Config, 100_000n);
+
+    const psbtInCall = payjoin.PsbtInput.create.mock.calls[0][0];
+    expect(psbtInCall.redeemScript).toBeUndefined();
+    expect(psbtInCall.witnessScript).toBeUndefined();
+  });
+
+  it('excludes a candidate whose InputPair construction throws, without aborting the other candidates', async () => {
+    cnClient.listUnspent.mockResolvedValue({
+      result: { utxos: [utxo(TXID_A, 0), utxo(TXID_B, 0), utxo(TXID_C, 0)] },
+      error: null,
+    });
+    payjoin.InputPair
+      .mockImplementationOnce(() => ({})) // TXID_A: ordinary P2WPKH-shaped candidate
+      .mockImplementationOnce(() => { throw new Error('Error.InvalidPsbtInput: PsbtInputError(PsbtInputError(WeightError(NoRedeemScript)))'); }) // TXID_B: unsupported script shape
+      .mockImplementationOnce(() => ({})); // TXID_C: ordinary P2WPKH-shaped candidate
+
+    const inputs = await availableInputs(mockConfig as Config, 100_000n);
+
+    expect(inputs.map((i: { txid: string }) => i.txid)).toEqual([TXID_A, TXID_C]);
   });
 });

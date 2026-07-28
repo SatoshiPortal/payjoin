@@ -8,6 +8,8 @@ export default interface IRespListUnspent {
       address: string;
       label: string;
       scriptPubKey: string;
+      redeemScript?: string;
+      witnessScript?: string;
       amount: number;
       confirmations: number;
       spendable: boolean;

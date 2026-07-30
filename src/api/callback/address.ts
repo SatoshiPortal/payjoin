@@ -10,6 +10,22 @@ export function addressCallbackUrl(type: "send" | "receive", address: string) {
   return `${config.URL_SERVER}:${config.URL_PORT}/${type}/address/${address}`;
 }
 
+// The txid stored at proposal time is only a guess (decodepsbt reports the PSBT's
+// global unsigned tx, which has every scriptSig emptied — see receive.ts around
+// decodedFinalPsbtResult — so it's wrong whenever an input's finalized form needs a
+// real scriptSig, e.g. the receiver contributing a P2SH-wrapped coin). A mismatch
+// against the real on-chain txid therefore does NOT by itself mean "non-payjoin": if
+// our own reserved input has been spent, nothing but our own signed proposal could
+// have spent it, so this is genuinely our payjoin under a different real txid.
+async function reservedInputWasSpent(payjoin: Receive): Promise<boolean> {
+  if (!payjoin.reservedInputTxid || payjoin.reservedInputVout == null) return false;
+  const { result } = await cnClient.listUnspent({ wallet: config.RECEIVE_WALLET });
+  const stillUnspent = result?.utxos.some(
+    u => u.txid === payjoin.reservedInputTxid && u.vout === payjoin.reservedInputVout
+  );
+  return !stillUnspent;
+}
+
 export async function handleAddressCallback(data: any, type: "send" | "receive") {
   logger.info(handleAddressCallback, "address callback:", JSON.stringify(data, null, 2));
 
@@ -28,7 +44,10 @@ export async function handleAddressCallback(data: any, type: "send" | "receive")
         return;
       }
 
-      if (type === "receive" && data.txid !== payjoin.txid) {
+      const mismatched = type === "receive" && data.txid !== payjoin.txid;
+      const looksLikeOurPayjoin = mismatched && await reservedInputWasSpent(payjoin as Receive);
+
+      if (mismatched && !looksLikeOurPayjoin) {
         let updatedPayjoin: Receive;
         if (payjoin.fallbackTs) {
           // this is a fallback tx

@@ -1,6 +1,6 @@
 import { addJsonRpcMethod } from "..";
 import { IReqReceive, IRespReceive } from "../../types/api/receive";
-import { isValidAddress, isValidAmount } from "../../lib/validate";
+import { isOwnedAddress, isValidAddress, isValidAmount } from "../../lib/validate";
 import logger from "../../lib/Log2File";
 import { JSONRPCErrorCode, JSONRPCErrorException } from "json-rpc-2.0";
 import { appendReceiveStatus, createReceiver } from "../../lib/payjoin";
@@ -18,6 +18,10 @@ export function registerReceiveApi(): void {
 export async function receive(params: IReqReceive): Promise<IRespReceive> {
   logger.info(receive, params);
 
+  // Only a caller-supplied address needs the ownership check below; one we derive
+  // ourselves comes from RECEIVE_WALLET by construction.
+  const callerSuppliedAddress = !!params.address;
+
   if (!params.address) {
     // Force bech32 to match the mobile wallet's bip84 default.
     const { error: addressError, result: addressResult } = await cnClient.getnewaddress({ addressType: "bech32", wallet: config.RECEIVE_WALLET});
@@ -32,6 +36,13 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
 
   if (!(await isValidAddress(params.address))) {
     throw new JSONRPCErrorException('Invalid address', JSONRPCErrorCode.InvalidParams);
+  }
+
+  // The payjoin adds one of our wallet UTXOs to the output paying this address,
+  // so accepting an address we don't own hands that UTXO to the caller.
+  if (callerSuppliedAddress && !(await isOwnedAddress(params.address))) {
+    logger.error(receive, 'rejecting receive address not owned by a configured wallet:', params.address);
+    throw new JSONRPCErrorException('Address is not owned by a configured wallet', JSONRPCErrorCode.InvalidParams);
   }
 
   if (!isValidAmount(params.amount)) {

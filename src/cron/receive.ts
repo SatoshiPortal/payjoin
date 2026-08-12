@@ -259,7 +259,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         logger.debug(processReceiveSession, 'Receiver is in MaybeInputsOwned state');
 
         receiver = receiver.checkInputsNotOwned(
-          { callback: (script: ArrayBuffer) => isOwned(script, config) },
+          { callback: (outpoint: payjoin.OutPoint) => isInputOwned(outpoint, config) },
         ).save(persister);
 
         logger.debug('checkInputsNotOwned complete');
@@ -653,36 +653,41 @@ function canBroadcast(tx: ArrayBuffer): boolean {
   }
 };
 
-function isOwned(script: ArrayBuffer, config: Config): boolean {
-  logger.debug(isOwned, 'checking if script is owned:', script);
+/**
+ * Resolves the outpoint to its scriptPubKey via a raw (non-wallet-scoped)
+ * transaction lookup, then checks address ownership the same way as before —
+ * mirrors rust-payjoin's own reference receiver, since `checkInputsNotOwned`
+ * now keys ownership on outpoint rather than script (payjoin-1.0.0-rc.8:
+ * this must cover every outpoint the wallet can sign, including locked and
+ * unconfirmed coins that `listunspent` omits, which a raw tx lookup does).
+ */
+function isInputOwned(outpoint: payjoin.OutPoint, config: Config): boolean {
+  logger.debug(isInputOwned, 'checking if outpoint is owned:', outpoint);
 
-  const scriptHex = arrayBufferToHex(script);
+  const { error: txError, result: txResult } = syncCnClient.syncGetTransaction(outpoint.txid);
 
-  const { error: decodeError, result: decodeResult } = syncCnClient.syncDecodeScript(
-    scriptHex,
-  );
-
-  if (decodeError || !decodeResult) {
-    logger.error(isOwned, 'failed to decode script:', decodeError);
+  if (txError || !txResult) {
+    logger.error(isInputOwned, 'failed to get transaction:', outpoint, txError);
     return false;
   }
 
-  if (!decodeResult.address) {
-    logger.debug(isOwned, 'script is not owned:', script);
+  const vout = txResult.vout.find((v) => v.n === Number(outpoint.vout));
+  if (!vout || !vout.scriptPubKey.address) {
+    logger.debug(isInputOwned, 'outpoint is not owned:', outpoint);
     return false;
   }
 
   const { error: receiverAddressError, result: receiverAddressResult } = syncCnClient.syncGetAddressInfo({
-    address: decodeResult.address,
+    address: vout.scriptPubKey.address,
     wallet: config.RECEIVE_WALLET,
   });
   if (receiverAddressError || !receiverAddressResult) {
-    logger.error(isOwned, 'failed to get address info:', receiverAddressError);
+    logger.error(isInputOwned, 'failed to get address info:', receiverAddressError);
     return false;
   }
 
   if (receiverAddressResult.ismine) {
-    logger.debug(isOwned, 'script is owned by receiver wallet:', script, decodeResult.address);
+    logger.debug(isInputOwned, 'outpoint is owned by receiver wallet:', outpoint, vout.scriptPubKey.address);
     return true;
   }
 

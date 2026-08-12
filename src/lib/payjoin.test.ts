@@ -462,11 +462,14 @@ describe('extractCommittedInputs', () => {
   const ev = (obj: unknown) => JSON.stringify(obj);
 
   const commitEvent = (prevouts: string[]) => ev({
-    CommittedInputs: prevouts.map((previous_output) => ({
-      txin: { previous_output, script_sig: '', sequence: 0, witness: [] },
-      psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
-      expected_weight: 272,
-    })),
+    CommittedInputs: {
+      receiver_inputs: prevouts.map((previous_output) => ({
+        txin: { previous_output, script_sig: '', sequence: 0, witness: [] },
+        psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
+        expected_weight: 272,
+      })),
+      payjoin_psbt: {},
+    },
   });
 
   it('returns the outpoint from a CommittedInputs event', () => {
@@ -492,13 +495,13 @@ describe('extractCommittedInputs', () => {
   });
 
   it('tolerates already-parsed object events', () => {
-    const events = [{ CommittedInputs: [{ txin: { previous_output: `${TXID}:5` } }] }];
+    const events = [{ CommittedInputs: { receiver_inputs: [{ txin: { previous_output: `${TXID}:5` } }] } }];
     expect(extractCommittedInputs(events)).toEqual([{ txid: TXID, vout: 5 }]);
   });
 
   it('fails loudly (undefined) on an unexpected outpoint shape', () => {
     // struct-shaped previous_output (non-human-readable serde) must not be silently dropped
-    const events = [ev({ CommittedInputs: [{ txin: { previous_output: { txid: TXID, vout: 1 } } }] })];
+    const events = [ev({ CommittedInputs: { receiver_inputs: [{ txin: { previous_output: { txid: TXID, vout: 1 } } }] } })];
     expect(extractCommittedInputs(events)).toBeUndefined();
     // malformed txid
     expect(extractCommittedInputs([commitEvent(['nothex:1'])])).toBeUndefined();

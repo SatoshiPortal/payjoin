@@ -206,8 +206,12 @@ export function extractReplyableError(sessionJson: string | null | undefined): s
  * The FFI's `tryPreservingPrivacy` return value exposes no outpoint accessors,
  * so the committed input can only be identified from the `CommittedInputs`
  * event that `commitInputs()` persists. Each event is a JSON-encoded string
- * shaped like `{"CommittedInputs":[{"txin":{"previous_output":"<txid>:<vout>",...},...}]}`
- * (`bitcoin::OutPoint` serializes as a "txid:vout" string in JSON).
+ * shaped like `{"CommittedInputs":{"receiver_inputs":[{"txin":{"previous_output":
+ * "<txid>:<vout>",...},...}],"payjoin_psbt":{...}}}` (`bitcoin::OutPoint`
+ * serializes as a "txid:vout" string in JSON). `receiver_inputs` used to be
+ * `CommittedInputs`'s entire value (a bare array, no `payjoin_psbt` sibling)
+ * on the payjoin version this once shipped against — payjoin-1.0.0-rc.8
+ * wraps it in an object instead.
  *
  * Accepts the in-memory event array from `ReceiverPersister.load()`. Returns
  * the outpoints of the committed inputs from the most recent event, or
@@ -222,7 +226,8 @@ export function extractCommittedInputs(events: unknown[]): { txid: string; vout:
   for (const ev of events) {
     let parsed: unknown;
     try { parsed = typeof ev === 'string' ? JSON.parse(ev) : ev; } catch { continue; }
-    const inputs = (parsed as { CommittedInputs?: Array<{ txin?: { previous_output?: string } }> })?.CommittedInputs;
+    const inputs = (parsed as { CommittedInputs?: { receiver_inputs?: Array<{ txin?: { previous_output?: string } }> } })
+      ?.CommittedInputs?.receiver_inputs;
     if (!Array.isArray(inputs)) continue;
 
     const outpoints: { txid: string; vout: number }[] = [];

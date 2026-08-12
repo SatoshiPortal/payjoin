@@ -540,11 +540,14 @@ describe('reserveCommittedInput', () => {
 
   const RESERVED_TXID = 'a'.repeat(64);
   const COMMIT_EVENT = JSON.stringify({
-    CommittedInputs: [{
-      txin: { previous_output: `${RESERVED_TXID}:1`, script_sig: '', sequence: 0, witness: [] },
-      psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
-      expected_weight: 272,
-    }],
+    CommittedInputs: {
+      receiver_inputs: [{
+        txin: { previous_output: `${RESERVED_TXID}:1`, script_sig: '', sequence: 0, witness: [] },
+        psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
+        expected_weight: 272,
+      }],
+      payjoin_psbt: {},
+    },
   });
 
   it('claims the committed outpoint on the row and takes a checked persistent wallet lock', async () => {

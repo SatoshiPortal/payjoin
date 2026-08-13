@@ -866,25 +866,13 @@ export async function releaseReservedInput(receiveSess: Receive, config: Config)
       let spentByPayjoin = false;
 
       const posted = sessionHasPostedProposal(fresh.session);
-      // Bounded hold (issue #8): a posted proposal normally only releases on a
-      // confirmed on-chain outcome, but that outcome may never come (sender
-      // vanished without broadcasting; row txid wedged by an unrelated
-      // payment). A generous grace period past session expiry bounds the hold:
-      // by then the abandoned-posted sweep has been broadcasting the
-      // conflicting fallback every cycle, so an outcome that was going to
-      // confirm has had ample time. If the reserved input turns out to be
-      // spent after all, the unlock below tolerates it ("expected unspent
-      // output" counts as released).
-      const graceExpired = fresh.expiryTs != null
-        && Date.now() > fresh.expiryTs.getTime() + config.RESERVATION_RELEASE_GRACE * 1000;
       if (posted) {
         if (!fresh.confirmedTs) {
-          if (!graceExpired) {
-            logger.debug(releaseReservedInput, `session ${fresh.id} posted its proposal but has no confirmed outcome — keeping reservation`);
-            return;
-          }
-          logger.warn(releaseReservedInput,
-            `session ${fresh.id} posted its proposal but nothing confirmed within ${config.RESERVATION_RELEASE_GRACE}s of expiry — force-releasing reservation`);
+          // Expiry does not invalidate a proposal already fetched by the
+          // sender. Reusing this input before a conflicting transaction
+          // confirms could leave two live proposals spending the same coin.
+          logger.debug(releaseReservedInput, `session ${fresh.id} posted its proposal but has no confirmed outcome — keeping reservation`);
+          return;
         } else if (fresh.nonPayjoinTs) {
           // The confirmed tx is not the proposal. It is almost always the
           // sender-broadcast original (which conflicts with the proposal), but
@@ -896,13 +884,9 @@ export async function releaseReservedInput(receiveSess: Receive, config: Config)
             originalTxid = decodeResult?.tx?.txid;
           }
           if (!originalTxid || fresh.txid !== originalTxid) {
-            if (!graceExpired) {
-              logger.warn(releaseReservedInput,
-                `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original — keeping reservation`);
-              return;
-            }
             logger.warn(releaseReservedInput,
-              `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original, but reservation grace has expired — force-releasing`);
+              `session ${fresh.id}: confirmed tx ${fresh.txid} is neither the payjoin nor the original — keeping reservation`);
+            return;
           }
         } else if (!fresh.fallbackTs) {
           // row.txid is the proposal itself (only the non-payjoin/fallback

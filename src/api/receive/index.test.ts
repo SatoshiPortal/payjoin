@@ -33,7 +33,9 @@ jest.mock('../../lib/globals', () => ({
 }));
 
 jest.mock('../callback', () => ({
-  addressCallbackUrl: jest.fn(() => 'http://payjoin:8000/receive/address/x'),
+  addressCallbackUrl: jest.fn((_type: string, _address: string, token?: string) =>
+    `http://payjoin:8000/receive/address/x${token ? `?token=${token}` : ''}`
+  ),
 }));
 
 jest.mock('../../lib/Log2File', () => ({
@@ -86,8 +88,8 @@ describe('receive address ownership gate', () => {
     cnClient.getnewaddress.mockResolvedValue({ result: { address: DERIVED_ADDRESS } });
     cnClient.watch.mockResolvedValue({});
 
-    db.receive.create.mockResolvedValue({ id: 1 });
-    db.receive.update.mockResolvedValue({ id: 1 });
+    db.receive.create.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ id: 1, ...data }));
+    db.receive.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ id: 1, ...data, callbackToken: 'token' }));
     createReceiver.mockResolvedValue({ bip21: 'bitcoin:x?pj=y', ohttpRelay: 'https://relay' });
   });
 
@@ -112,6 +114,19 @@ describe('receive address ownership gate', () => {
     });
     expect(isOwnedAddress).not.toHaveBeenCalled();
     expect(db.receive.create).toHaveBeenCalled();
+  });
+
+  it('stores a random token and includes it in both watch callback URLs', async () => {
+    await receive(params({ address: CALLER_ADDRESS }));
+
+    expect(db.receive.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ callbackToken: expect.stringMatching(/^[0-9a-f]{64}$/) }),
+    });
+    expect(cnClient.watch).toHaveBeenCalledWith({
+      address: CALLER_ADDRESS,
+      unconfirmedCallbackURL: expect.stringMatching(/\?token=token$/),
+      confirmedCallbackURL: expect.stringMatching(/\?token=token$/),
+    });
   });
 
   it('rejects an unowned caller-supplied address with -32602 and the ownership message', async () => {

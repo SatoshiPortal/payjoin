@@ -380,9 +380,7 @@ export function appendReceiveStatus(receive: Receive) {
   }
 
   return {
-    // reservedInput* is internal wallet-reservation bookkeeping (issue #8) —
-    // never expose wallet outpoints through the API or callbacks
-    ...Utils.omit(receive, ['session', 'reservedInputTxid', 'reservedInputVout']),
+    ...Utils.omit(receive, ['session', 'reservedInputTxid', 'reservedInputVout', 'callbackToken']),
     status
   } as IRespReceive;
 }
@@ -400,7 +398,7 @@ export function appendSendStatus(send: Send) {
   }
 
   return {
-    ...Utils.omit(send, ['session']),
+    ...Utils.omit(send, ['session', 'callbackToken']),
     status
   } as IRespSend;
 }

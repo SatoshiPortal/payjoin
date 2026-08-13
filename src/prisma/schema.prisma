@@ -29,6 +29,7 @@ model Send {
   fee               BigInt?
   senderFee         BigInt?       @map("sender_fee")
   callbackUrl       String?       @map("callback_url")
+  callbackToken     String?       @unique @map("callback_token")
   calledBackTs      DateTime?     @map("called_back_ts")
   expiryTs          DateTime?     @map("expiry_ts")
   cancelledTs       DateTime?     @map("cancelled_ts")
@@ -64,6 +65,7 @@ model Receive {
   reservedInputTxid   String?       @map("reserved_input_txid")
   reservedInputVout   Int?          @map("reserved_input_vout")
   callbackUrl         String?       @map("callback_url")
+  callbackToken       String?       @unique @map("callback_token")
   calledBackTs        DateTime?     @map("called_back_ts")
   expiryTs            DateTime?     @map("expiry_ts")
   cancelledTs         DateTime?     @map("cancelled_ts")

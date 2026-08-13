@@ -98,6 +98,7 @@ function makeReceiveSess(overrides: Partial<Receive> = {}): Receive {
     reservedInputTxid: null,
     reservedInputVout: null,
     callbackUrl: null,
+    callbackToken: null,
     calledBackTs: null,
     expiryTs: null,
     cancelledTs: null,
@@ -425,7 +426,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
-  it('checks the node for the posted proposal before broadcasting', async () => {
+  it('checks Bitcoin Core for the posted proposal before broadcasting', async () => {
     const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
     // definite not-found — the only lookup outcome that may broadcast
     cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -5, message: 'No such mempool or blockchain transaction' } });
@@ -438,7 +439,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update.mock.calls[0][0].data.txid).toBe(FALLBACK_TXID);
   });
 
-  it('skips the broadcast and stamps firstSeenTs when the payjoin tx is known to the node', async () => {
+  it('skips the broadcast and stamps firstSeenTs when the payjoin tx is known to Bitcoin Core', async () => {
     const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
     cnClient.getTransaction.mockResolvedValue({ result: { txid: PROPOSAL_TXID, confirmations: 0 } });
 
@@ -452,7 +453,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(updateArgs.data).not.toHaveProperty('amount');
   });
 
-  it('defers the broadcast when the node lookup fails (unknown outcome, not "not found")', async () => {
+  it('defers the broadcast when the Bitcoin Core lookup fails (unknown outcome, not "not found")', async () => {
     const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
     // transport/gatekeeper failure surfaces as a generic InternalError, not -5
     cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -32603, message: 'connect ECONNREFUSED' } });
@@ -463,7 +464,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
-  it('does not consult the node when no proposal was ever posted (txid null)', async () => {
+  it('does not consult Bitcoin Core when no proposal was ever posted (txid null)', async () => {
     cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
 
     await broadcastFallback(makeReceiveSess({ txid: null }), mockConfig as Config);

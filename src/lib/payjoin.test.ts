@@ -82,6 +82,7 @@ function makeReceive(overrides: Partial<Receive> = {}): Receive {
     reservedInputTxid: null,
     reservedInputVout: null,
     callbackUrl: null,
+    callbackToken: null,
     calledBackTs: null,
     expiryTs: null,
     cancelledTs: null,
@@ -116,6 +117,7 @@ function makeSend(overrides: Partial<Send> = {}): Send {
     fee: null,
     senderFee: null,
     callbackUrl: null,
+    callbackToken: null,
     calledBackTs: null,
     expiryTs: null,
     cancelledTs: null,
@@ -541,6 +543,30 @@ describe('appendReceiveStatus — reservation fields are internal', () => {
     expect(result).not.toHaveProperty('reservedInputTxid');
     expect(result).not.toHaveProperty('reservedInputVout');
     expect(result).not.toHaveProperty('session');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// callbackToken is the watch-callback capability secret. Anything that can reach
+// the API can also reach the callback route, so disclosing it through an API
+// response or an outbound webhook hands back the forgery capability the token
+// exists to remove (audit Finding 2).
+// ---------------------------------------------------------------------------
+
+describe('callbackToken is never disclosed', () => {
+  const TOKEN = 'f'.repeat(64);
+
+  it('omits callbackToken from receive API responses and webhook payloads', () => {
+    const result = appendReceiveStatus(makeReceive({ callbackToken: TOKEN }));
+    expect(result).not.toHaveProperty('callbackToken');
+    // also catches the token being carried under any other key
+    expect(Object.values(result)).not.toContain(TOKEN);
+  });
+
+  it('omits callbackToken from send API responses and webhook payloads', () => {
+    const result = appendSendStatus(makeSend({ callbackToken: TOKEN }));
+    expect(result).not.toHaveProperty('callbackToken');
+    expect(Object.values(result)).not.toContain(TOKEN);
   });
 });
 

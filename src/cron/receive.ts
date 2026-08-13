@@ -370,9 +370,9 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
               // swap the watch from the original BIP21 address to the substituted address
               // so that the address callback fires correctly when the payjoin tx confirms
-              const oldWatchUrl = addressCallbackUrl('receive', receiveSess.address!);
+              const oldWatchUrl = addressCallbackUrl('receive', receiveSess.address!, receiveSess.callbackToken);
               await cnClient.unwatch({ address: receiveSess.address!, unconfirmedCallbackURL: oldWatchUrl, confirmedCallbackURL: oldWatchUrl });
-              const newWatchUrl = addressCallbackUrl('receive', effectiveReceiverAddress);
+              const newWatchUrl = addressCallbackUrl('receive', effectiveReceiverAddress, receiveSess.callbackToken);
               await cnClient.watch({ address: effectiveReceiverAddress, unconfirmedCallbackURL: newWatchUrl, confirmedCallbackURL: newWatchUrl });
               receiveSess = await db.receive.update({ where: { id: receiveSess.id }, data: { address: effectiveReceiverAddress } });
             } catch (subErr) {
@@ -1124,7 +1124,7 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
   }
 
   // issue #6: a null firstSeenTs only proves the address-watch callback hasn't
-  // fired — ask the node directly before broadcasting the conflicting fallback.
+  // fired — ask Bitcoin Core directly before broadcasting the conflicting fallback.
   // receiveSess.txid is the posted payjoin proposal txid here (the failed-session
   // queue filters txid: null). Only a definite not-found (bitcoind -5) may
   // proceed; any other lookup failure is an unknown outcome — retry next cycle.

@@ -60,7 +60,7 @@ export function registerApi(app: Application): void {
       return;
     }
     trackTask(`send-address-callback-${Date.now()}`, () =>
-      handleAddressCallback(req.body, "send")
+      handleAddressCallback(req.body, "send", typeof req.query.token === "string" ? req.query.token : undefined)
     ).catch((e: any) => {
       logger.error('callback', 'Failed to handle address callback:', e);
     });
@@ -73,7 +73,7 @@ export function registerApi(app: Application): void {
       return;
     }
     trackTask(`receive-address-callback-${Date.now()}`, () =>
-      handleAddressCallback(req.body, "receive")
+      handleAddressCallback(req.body, "receive", typeof req.query.token === "string" ? req.query.token : undefined)
     ).catch((e: any) => {
       logger.error('callback', 'Failed to handle address callback:', e);
     });

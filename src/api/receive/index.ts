@@ -8,6 +8,7 @@ import { config } from "../../config";
 import { db } from "../../lib/db";
 import { addressCallbackUrl } from "../callback";
 import { lock, cnClient } from "../../lib/globals";
+import { randomBytes } from "crypto";
 
 export function registerReceiveApi(): void {
   addJsonRpcMethod('receive', receive);
@@ -54,6 +55,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
       amount: params.amount,
       address: params.address,
       callbackUrl: params.callbackUrl,
+      callbackToken: randomBytes(32).toString("hex"),
       expiryTs: new Date(Date.now() + Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000),
     }
 
@@ -70,7 +72,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
     });
 
     // watch the address for non-payjoin transactions
-    const watchUrl = addressCallbackUrl('receive', params.address);
+    const watchUrl = addressCallbackUrl('receive', params.address, receive.callbackToken!);
     await cnClient.watch({
       address: params.address,
       unconfirmedCallbackURL: watchUrl,
@@ -122,7 +124,7 @@ async function cancelReceive(params: { id: number }): Promise<{ id: number }> {
         }
 
         // stop watching the address
-        const watchUrl = addressCallbackUrl('receive', receive.address);
+        const watchUrl = addressCallbackUrl('receive', receive.address, receive.callbackToken);
         await cnClient.unwatch({
           address: receive.address,
           unconfirmedCallbackURL: watchUrl,

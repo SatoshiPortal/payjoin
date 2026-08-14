@@ -24,6 +24,7 @@ model Send {
   txInputs          Json?         @map("tx_inputs")
   txOutputs         Json?         @map("tx_outputs")
   lockedInputs      Json?         @map("locked_inputs")
+  fallbackTxHex     String?       @map("fallback_tx_hex")
   txid              String?
   address           String?
   fee               BigInt?
@@ -35,6 +36,7 @@ model Send {
   cancelledTs       DateTime?     @map("cancelled_ts")
   session           String?
   ohttpRelay        String?       @map("ohttp_relay")
+  fallbackTs        DateTime?     @map("fallback_broadcast_ts")
   confirmedTs       DateTime?     @map("confirmed_ts")
   createdTs         DateTime      @default(now()) @map("created_ts")
   updatedTs         DateTime      @updatedAt @map("updated_ts")

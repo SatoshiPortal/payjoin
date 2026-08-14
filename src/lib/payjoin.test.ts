@@ -21,6 +21,7 @@ jest.mock('./globals', () => ({
     createFundedPsbt: jest.fn(),
     decodePsbt: jest.fn(),
     processPsbt: jest.fn(),
+    finalizePsbt: jest.fn(),
   },
   syncCnClient: {},
   lock: {},
@@ -112,6 +113,7 @@ function makeSend(overrides: Partial<Send> = {}): Send {
     txInputs: null,
     txOutputs: null,
     lockedInputs: null,
+    fallbackTxHex: null,
     txid: null,
     address: 'bc1qtest',
     fee: null,
@@ -123,6 +125,7 @@ function makeSend(overrides: Partial<Send> = {}): Send {
     cancelledTs: null,
     session: null,
     ohttpRelay: null,
+    fallbackTs: null,
     confirmedTs: null,
     createdTs: new Date(),
     updatedTs: new Date(),
@@ -583,6 +586,8 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     { txid: 'b'.repeat(64), vout: 2, scriptSig: { asm: '', hex: '' }, txinwitness: [], sequence: 0 },
   ];
 
+  const FALLBACK_HEX = '0200000001aabbccdd00000000';
+
   function rawTxWithVin(vin: typeof LOCKED_VIN) {
     return {
       txid: 'c'.repeat(64), hash: 'c'.repeat(64), version: 2, size: 200, vsize: 200,
@@ -596,6 +601,7 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     cnClient.createFundedPsbt.mockResolvedValue({ result: { psbt: FUNDED_PSBT, fee: 0.00001, changepos: 1 }, error: null });
     cnClient.decodePsbt.mockResolvedValue({ result: { inputs: [], outputs: [], tx: rawTxWithVin(LOCKED_VIN) }, error: null });
     cnClient.processPsbt.mockResolvedValue({ result: { psbt: 'signed', complete: true }, error: null });
+    cnClient.finalizePsbt.mockResolvedValue({ result: { hex: FALLBACK_HEX, psbt: 'signed' }, error: null });
   }
 
   beforeEach(() => jest.clearAllMocks());
@@ -622,7 +628,35 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
 
     await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
 
-    expect(callOrder).toEqual(['db.send.update', 'processPsbt']);
+    // the trailing update is the fallback tx hex, recorded only once the
+    // original is signed — the lockedInputs write must still come first
+    expect(callOrder).toEqual(['db.send.update', 'processPsbt', 'db.send.update']);
+  });
+
+  it('records the signed original as fallbackTxHex so the expiry sweep can broadcast it', async () => {
+    setupHappyPath();
+
+    await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
+
+    expect(cnClient.finalizePsbt).toHaveBeenCalledWith(
+      expect.objectContaining({ psbt: 'signed', extract: true }),
+    );
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 7 },
+      data: { fallbackTxHex: FALLBACK_HEX },
+    });
+  });
+
+  it('still returns a usable sender when the fallback tx hex cannot be extracted', async () => {
+    setupHappyPath();
+    cnClient.finalizePsbt.mockResolvedValue({ result: null, error: { code: -1, message: 'extract failed' } });
+
+    const { psbt } = await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
+
+    expect(psbt).toBe('signed');
+    expect(db.send.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ fallbackTxHex: expect.anything() }) }),
+    );
   });
 
   it('throws and never records lockedInputs when createFundedPsbt itself fails (nothing was locked)', async () => {

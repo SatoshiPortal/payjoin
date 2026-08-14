@@ -25,6 +25,7 @@ export interface IRespSend {
   expiryTs: Date | null;
   cancelledTs: Date | null;
   ohttpRelay: string | null;
+  fallbackTs: Date | null;
   confirmedTs: Date | null;
   createdTs: Date;
   updatedTs: Date;

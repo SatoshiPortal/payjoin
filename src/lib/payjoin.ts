@@ -350,6 +350,21 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
 
   const psbt = processedPsbtResult.psbt;
 
+  // Record the signed original ("fallback") tx so the grace-expiry sweep can
+  // broadcast it itself when the receiver never does. Best-effort: the sweep
+  // re-derives it from the SDK session history if this is missing, so a
+  // failure here must not abort a send that is otherwise ready to go.
+  const { error: extractError, result: extractResult } = await cnClient.finalizePsbt({
+    psbt,
+    extract: true,
+    wallet: config.SEND_WALLET,
+  });
+  if (extractError || !extractResult?.hex) {
+    logger.warn(createSender, 'failed to extract fallback tx hex — will re-derive from session history if needed:', extractError);
+  } else {
+    await db.send.update({ where: { id: Number(id) }, data: { fallbackTxHex: extractResult.hex } });
+  }
+
   const persister = new SenderPersister({ id, db });
 
   new payjoin.SenderBuilder(psbt, pjUri)
@@ -391,6 +406,8 @@ export function appendSendStatus(send: Send) {
     status = SendStatus.Cancelled;
   } else if (send.confirmedTs) {
     status = SendStatus.Confirmed;
+  } else if (send.fallbackTs) {
+    status = SendStatus.Fallback;
   } else if (send.txid) {
     status = SendStatus.Unconfirmed;
   } else if (!send.txid && !send.confirmedTs && send.expiryTs && send.expiryTs < new Date()) {
@@ -398,7 +415,7 @@ export function appendSendStatus(send: Send) {
   }
 
   return {
-    ...Utils.omit(send, ['session', 'callbackToken']),
+    ...Utils.omit(send, ['session', 'callbackToken', 'fallbackTxHex']),
     status
   } as IRespSend;
 }

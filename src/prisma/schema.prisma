@@ -24,16 +24,19 @@ model Send {
   txInputs          Json?         @map("tx_inputs")
   txOutputs         Json?         @map("tx_outputs")
   lockedInputs      Json?         @map("locked_inputs")
+  fallbackTxHex     String?       @map("fallback_tx_hex")
   txid              String?
   address           String?
   fee               BigInt?
   senderFee         BigInt?       @map("sender_fee")
   callbackUrl       String?       @map("callback_url")
+  callbackToken     String?       @unique @map("callback_token")
   calledBackTs      DateTime?     @map("called_back_ts")
   expiryTs          DateTime?     @map("expiry_ts")
   cancelledTs       DateTime?     @map("cancelled_ts")
   session           String?
   ohttpRelay        String?       @map("ohttp_relay")
+  fallbackTs        DateTime?     @map("fallback_broadcast_ts")
   confirmedTs       DateTime?     @map("confirmed_ts")
   createdTs         DateTime      @default(now()) @map("created_ts")
   updatedTs         DateTime      @updatedAt @map("updated_ts")
@@ -64,6 +67,7 @@ model Receive {
   reservedInputTxid   String?       @map("reserved_input_txid")
   reservedInputVout   Int?          @map("reserved_input_vout")
   callbackUrl         String?       @map("callback_url")
+  callbackToken       String?       @unique @map("callback_token")
   calledBackTs        DateTime?     @map("called_back_ts")
   expiryTs            DateTime?     @map("expiry_ts")
   cancelledTs         DateTime?     @map("cancelled_ts")

@@ -10,6 +10,7 @@ import { IReqProcessPsbt } from "../types/cyphernode/IReqProcessPsbt";
 import { IReqGetAddressInfo } from "../types/cyphernode/IReqGetAddressInfo";
 import IRespGetAddressInfo from "../types/cyphernode/IRespGetAddressInfo";
 import IRespDecodeScript from "../types/cyphernode/IRespDecodeScript";
+import IRespGetTransaction from "../types/cyphernode/IRespGetTransaction";
 
 /**
  * NOTE: sync-request ignores per-request agentOptions (ca / rejectUnauthorized),
@@ -167,5 +168,13 @@ export class SyncCyphernodeClient extends CyphernodeClient {
     const response = this._get(`/decodescript/${scriptPubKey}`);
 
     return this.handleResponse(response) as IRespDecodeScript;
+  }
+
+  syncGetTransaction(txId: string): IRespGetTransaction {
+    logger.info("SyncCyphernodeClient.getTransaction:", txId);
+
+    const response = this._get(`/gettransaction/${txId}`);
+
+    return this.handleResponse(response) as IRespGetTransaction;
   }
 }

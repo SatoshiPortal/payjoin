@@ -9,7 +9,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /payjoin
-# Locally-built payjoin bindings referenced as file:vendor/payjoin-0.1.1.tgz for try_privacy_preserving bug fix.
+# Locally-built payjoin bindings referenced as file:vendor/payjoin-1.0.0.tgz (see vendor/README.md).
 COPY vendor /payjoin/vendor
 COPY package.json package-lock.json /payjoin/
 RUN npm ci

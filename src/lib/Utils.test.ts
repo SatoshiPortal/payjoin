@@ -33,6 +33,20 @@ describe('Utils.btcToSats — float rounding', () => {
     // accepts number input too
     [0.29,       29_000_000n],
     [1,          100_000_000n],
+
+    // JS renders anything below 1e-6 in exponential form ("1e-8"), which a naive
+    // "." split cannot parse. Every vout of a verified callback transaction is fed
+    // through here (amountPaidToAddress), so these must not throw.
+    [0.000001,   100n],
+    [0.0000009,  90n],
+    [0.00000001, 1n],
+    [1e-8,       1n],
+    ['1e-8',     1n],
+    [0,          0n],
+
+    // negatives: "-0.5" previously came back positive because BigInt('-0') is 0n
+    ['-0.5',     -50_000_000n],
+    [-1.5,       -150_000_000n],
   ];
 
   test.each(cases)('btcToSats(%s) === %s', (input, expected) => {
@@ -41,6 +55,10 @@ describe('Utils.btcToSats — float rounding', () => {
 
   it('throws on non-numeric input', () => {
     expect(() => Utils.btcToSats('abc')).toThrow('Invalid number');
+  });
+
+  it('throws on a magnitude no bitcoin amount can reach', () => {
+    expect(() => Utils.btcToSats(1e21)).toThrow('Invalid number');
   });
 
 });

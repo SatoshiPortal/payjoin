@@ -24,7 +24,9 @@ curl -X POST http://localhost:8000/jsonrpc \
           }
         }' | jq
 ```
-_Note: when an address is provided in this way payjoin has no way to verify the address belongs to one of our wallets. This API should be locked down as much as possible_
+_Note: a caller-supplied address must be owned (`ismine`) by one of the wallets listed in `OWNED_WALLETS` — otherwise the request is rejected with `-32602`. This matters because the payjoin adds one of our own wallet UTXOs to the output paying this address, so an address we do not own would drain the receive wallet one UTXO per session. The check fails closed: if the gatekeeper cannot confirm ownership, the request is rejected. This API should still be locked down as much as possible._
+
+_`OWNED_WALLETS` (config.env) is a comma-separated list of cyphernode wallet indices, defaulting to `RECEIVE_WALLET` + `SEND_WALLET`. It must cover every wallet that can produce a receive address._
 
 
 Create a Payjoin receive request without providing an address:
@@ -85,6 +87,19 @@ curl -H 'Content-Type: application/json' \
   "error": {
     "code": -32602,
     "message": "Invalid address format",
+    "data": null
+  }
+}
+```
+
+The supplied address is not owned by any wallet in `OWNED_WALLETS` (or ownership could not be confirmed):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "Address is not owned by a configured wallet",
     "data": null
   }
 }
@@ -370,8 +385,10 @@ docker-compose -f cypherapps/docker-compose.dev.yaml up -d
 
 #### In dev mode:
 
+The wallet used here must be listed in `OWNED_WALLETS`. With the `config.env` shipped in this repo that is `spending02.dat` and `spending01.dat`; when neither `OWNED_WALLETS` nor the wallet keys are set at all, the built-in default is `RECEIVE_WALLET` + `SEND_WALLET`, both of which fall back to `01`. To use another wallet — e.g. `spending06.dat` — add its index to `OWNED_WALLETS` first, or the `receive` call is rejected with `-32602`.
+
 ```bash
-address=$(docker exec $(docker ps --filter "name=bitcoin" --format "{{.ID}}") bitcoin-cli -rpcwallet=spending06.dat getnewaddress)
+address=$(docker exec $(docker ps --filter "name=bitcoin" --format "{{.ID}}") bitcoin-cli -rpcwallet=spending02.dat getnewaddress)
 uri=$(curl -s -H 'Content-Type: application/json' -d "{"jsonrpc":2, "id":1, "method":"receive", "params":{"address": "${address}", "amount": 100000}}" http://localhost:8000/jsonrpc | jq -cr '.result.bip21')
 ```
 

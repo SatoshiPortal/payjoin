@@ -100,9 +100,25 @@ class Utils {
       throw new Error("Invalid number");
     }
 
-    const [intPart, fracPart = ''] = String(btc).split('.');
+    // JS stringifies anything below 1e-6 in exponential form ("1e-8"), which the
+    // digit split below cannot parse. Any transaction output paying a watched
+    // address reaches here (amountPaidToAddress), so a sub-100-sat vout must not
+    // throw. Render those as plain decimal at bitcoin's 8 places first; string
+    // inputs already in decimal form keep their existing truncation behaviour.
+    let str = String(btc);
+    if (/e/i.test(str)) {
+      str = Number(btc).toFixed(8);
+      if (/e/i.test(str)) {
+        // out of range for a bitcoin amount (>= 1e21) — toFixed stays exponential
+        throw new Error("Invalid number");
+      }
+    }
+
+    const negative = str.startsWith('-');
+    const [intPart, fracPart = ''] = (negative ? str.slice(1) : str).split('.');
     const paddedFrac = fracPart.padEnd(8, '0').slice(0, 8);
-    return BigInt(intPart) * 100_000_000n + BigInt(paddedFrac);
+    const sats = BigInt(intPart || '0') * 100_000_000n + BigInt(paddedFrac);
+    return negative ? -sats : sats;
   }
 
   static jsonReplacer(key: string, value: any): any {

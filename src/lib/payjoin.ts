@@ -206,8 +206,12 @@ export function extractReplyableError(sessionJson: string | null | undefined): s
  * The FFI's `tryPreservingPrivacy` return value exposes no outpoint accessors,
  * so the committed input can only be identified from the `CommittedInputs`
  * event that `commitInputs()` persists. Each event is a JSON-encoded string
- * shaped like `{"CommittedInputs":[{"txin":{"previous_output":"<txid>:<vout>",...},...}]}`
- * (`bitcoin::OutPoint` serializes as a "txid:vout" string in JSON).
+ * shaped like `{"CommittedInputs":{"receiver_inputs":[{"txin":{"previous_output":
+ * "<txid>:<vout>",...},...}],"payjoin_psbt":{...}}}` (`bitcoin::OutPoint`
+ * serializes as a "txid:vout" string in JSON). `receiver_inputs` used to be
+ * `CommittedInputs`'s entire value (a bare array, no `payjoin_psbt` sibling)
+ * on the payjoin version this once shipped against — payjoin-1.0.0-rc.8
+ * wraps it in an object instead.
  *
  * Accepts the in-memory event array from `ReceiverPersister.load()`. Returns
  * the outpoints of the committed inputs from the most recent event, or
@@ -222,7 +226,8 @@ export function extractCommittedInputs(events: unknown[]): { txid: string; vout:
   for (const ev of events) {
     let parsed: unknown;
     try { parsed = typeof ev === 'string' ? JSON.parse(ev) : ev; } catch { continue; }
-    const inputs = (parsed as { CommittedInputs?: Array<{ txin?: { previous_output?: string } }> })?.CommittedInputs;
+    const inputs = (parsed as { CommittedInputs?: { receiver_inputs?: Array<{ txin?: { previous_output?: string } }> } })
+      ?.CommittedInputs?.receiver_inputs;
     if (!Array.isArray(inputs)) continue;
 
     const outpoints: { txid: string; vout: number }[] = [];
@@ -345,6 +350,21 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
 
   const psbt = processedPsbtResult.psbt;
 
+  // Record the signed original ("fallback") tx so the grace-expiry sweep can
+  // broadcast it itself when the receiver never does. Best-effort: the sweep
+  // re-derives it from the SDK session history if this is missing, so a
+  // failure here must not abort a send that is otherwise ready to go.
+  const { error: extractError, result: extractResult } = await cnClient.finalizePsbt({
+    psbt,
+    extract: true,
+    wallet: config.SEND_WALLET,
+  });
+  if (extractError || !extractResult?.hex) {
+    logger.warn(createSender, 'failed to extract fallback tx hex — will re-derive from session history if needed:', extractError);
+  } else {
+    await db.send.update({ where: { id: Number(id) }, data: { fallbackTxHex: extractResult.hex } });
+  }
+
   const persister = new SenderPersister({ id, db });
 
   new payjoin.SenderBuilder(psbt, pjUri)
@@ -375,9 +395,7 @@ export function appendReceiveStatus(receive: Receive) {
   }
 
   return {
-    // reservedInput* is internal wallet-reservation bookkeeping (issue #8) —
-    // never expose wallet outpoints through the API or callbacks
-    ...Utils.omit(receive, ['session', 'reservedInputTxid', 'reservedInputVout']),
+    ...Utils.omit(receive, ['session', 'reservedInputTxid', 'reservedInputVout', 'callbackToken']),
     status
   } as IRespReceive;
 }
@@ -388,6 +406,8 @@ export function appendSendStatus(send: Send) {
     status = SendStatus.Cancelled;
   } else if (send.confirmedTs) {
     status = SendStatus.Confirmed;
+  } else if (send.fallbackTs) {
+    status = SendStatus.Fallback;
   } else if (send.txid) {
     status = SendStatus.Unconfirmed;
   } else if (!send.txid && !send.confirmedTs && send.expiryTs && send.expiryTs < new Date()) {
@@ -395,7 +415,7 @@ export function appendSendStatus(send: Send) {
   }
 
   return {
-    ...Utils.omit(send, ['session']),
+    ...Utils.omit(send, ['session', 'callbackToken', 'fallbackTxHex']),
     status
   } as IRespSend;
 }

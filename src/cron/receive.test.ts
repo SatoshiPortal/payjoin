@@ -98,6 +98,7 @@ function makeReceiveSess(overrides: Partial<Receive> = {}): Receive {
     reservedInputTxid: null,
     reservedInputVout: null,
     callbackUrl: null,
+    callbackToken: null,
     calledBackTs: null,
     expiryTs: null,
     cancelledTs: null,
@@ -425,7 +426,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
-  it('checks the node for the posted proposal before broadcasting', async () => {
+  it('checks Bitcoin Core for the posted proposal before broadcasting', async () => {
     const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
     // definite not-found — the only lookup outcome that may broadcast
     cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -5, message: 'No such mempool or blockchain transaction' } });
@@ -438,7 +439,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update.mock.calls[0][0].data.txid).toBe(FALLBACK_TXID);
   });
 
-  it('skips the broadcast and stamps firstSeenTs when the payjoin tx is known to the node', async () => {
+  it('skips the broadcast and stamps firstSeenTs when the payjoin tx is known to Bitcoin Core', async () => {
     const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
     cnClient.getTransaction.mockResolvedValue({ result: { txid: PROPOSAL_TXID, confirmations: 0 } });
 
@@ -452,7 +453,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(updateArgs.data).not.toHaveProperty('amount');
   });
 
-  it('defers the broadcast when the node lookup fails (unknown outcome, not "not found")', async () => {
+  it('defers the broadcast when the Bitcoin Core lookup fails (unknown outcome, not "not found")', async () => {
     const PROPOSAL_TXID = 'feed5678feed5678feed5678feed5678feed5678feed5678feed5678feed5678';
     // transport/gatekeeper failure surfaces as a generic InternalError, not -5
     cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -32603, message: 'connect ECONNREFUSED' } });
@@ -463,7 +464,7 @@ describe('broadcastFallback — output substitution address bug', () => {
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
-  it('does not consult the node when no proposal was ever posted (txid null)', async () => {
+  it('does not consult Bitcoin Core when no proposal was ever posted (txid null)', async () => {
     cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
 
     await broadcastFallback(makeReceiveSess({ txid: null }), mockConfig as Config);
@@ -540,11 +541,14 @@ describe('reserveCommittedInput', () => {
 
   const RESERVED_TXID = 'a'.repeat(64);
   const COMMIT_EVENT = JSON.stringify({
-    CommittedInputs: [{
-      txin: { previous_output: `${RESERVED_TXID}:1`, script_sig: '', sequence: 0, witness: [] },
-      psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
-      expected_weight: 272,
-    }],
+    CommittedInputs: {
+      receiver_inputs: [{
+        txin: { previous_output: `${RESERVED_TXID}:1`, script_sig: '', sequence: 0, witness: [] },
+        psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
+        expected_weight: 272,
+      }],
+      payjoin_psbt: {},
+    },
   });
 
   it('claims the committed outpoint on the row and takes a checked persistent wallet lock', async () => {
@@ -780,42 +784,22 @@ describe('releaseReservedInput', () => {
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
-  // -------------------------------------------------------------------------
-  // Bounded hold: RESERVATION_RELEASE_GRACE past expiry force-releases
-  // -------------------------------------------------------------------------
-
   const GRACE_MS = 86400 * 1000;
 
-  it('force-releases a posted, never-confirmed session once grace past expiry has elapsed', async () => {
+  it('keeps a posted, never-confirmed session reserved even long after expiry', async () => {
     db.receive.findUnique.mockResolvedValue(reservedSess({
       session: POSTED_SESSION,
       txid: PROPOSAL_TXID,
       expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
       confirmedTs: null,
     }));
-    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
-
-    await releaseReservedInput(reservedSess(), mockConfig as Config);
-
-    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
-    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
-  });
-
-  it('still keeps a posted, unconfirmed session while within the grace window', async () => {
-    db.receive.findUnique.mockResolvedValue(reservedSess({
-      session: POSTED_SESSION,
-      txid: PROPOSAL_TXID,
-      expiryTs: new Date(Date.now() - GRACE_MS + 60_000),
-      confirmedTs: null,
-    }));
-
     await releaseReservedInput(reservedSess(), mockConfig as Config);
 
     expect(cnClient.lockUnspent).not.toHaveBeenCalled();
     expect(db.receive.update).not.toHaveBeenCalled();
   });
 
-  it('force-releases a wedged "neither payjoin nor original" session after grace', async () => {
+  it('keeps a wedged "neither payjoin nor original" session reserved after grace', async () => {
     db.receive.findUnique.mockResolvedValue(reservedSess({
       session: POSTED_SESSION,
       txid: 'f'.repeat(64), // unrelated tx overwrote the row txid
@@ -824,41 +808,6 @@ describe('releaseReservedInput', () => {
       expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
     }));
     cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
-    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
-
-    await releaseReservedInput(reservedSess(), mockConfig as Config);
-
-    expect(cnClient.lockUnspent).toHaveBeenCalledWith(UNLOCK_CALL);
-    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
-  });
-
-  it('tolerates a spent reserved input when force-releasing (payjoin confirmed but row wedged)', async () => {
-    db.receive.findUnique.mockResolvedValue(reservedSess({
-      session: POSTED_SESSION,
-      txid: 'f'.repeat(64),
-      nonPayjoinTs: new Date(),
-      confirmedTs: new Date(),
-      expiryTs: new Date(Date.now() - GRACE_MS - 60_000),
-    }));
-    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx());
-    cnClient.lockUnspent.mockResolvedValue({
-      result: null,
-      error: { code: -32603, message: 'Invalid parameter, expected unspent output' },
-    });
-
-    await releaseReservedInput(reservedSess(), mockConfig as Config);
-
-    expect(db.receive.update).toHaveBeenCalledWith(CLEAR_CALL);
-  });
-
-  it('never force-releases a posted session with no expiryTs', async () => {
-    db.receive.findUnique.mockResolvedValue(reservedSess({
-      session: POSTED_SESSION,
-      txid: PROPOSAL_TXID,
-      expiryTs: null,
-      confirmedTs: null,
-    }));
-
     await releaseReservedInput(reservedSess(), mockConfig as Config);
 
     expect(cnClient.lockUnspent).not.toHaveBeenCalled();

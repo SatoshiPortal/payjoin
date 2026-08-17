@@ -3,6 +3,33 @@ import { appendFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
 import Utils from "./Utils";
 
+const REDACTED = "[REDACTED]";
+
+function redactString(value: string): string {
+  return value.replace(/(\btoken=)[^&#\s]*/gi, `$1${REDACTED}`);
+}
+
+function sensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return normalized === "authorization" || normalized.endsWith("token");
+}
+
+/** Return a log-safe copy while preserving useful diagnostic structure. */
+export function redactForLogging(value: unknown): unknown {
+  if (typeof value === "string") return redactString(value);
+  if (Array.isArray(value)) return value.map(redactForLogging);
+  if (value instanceof Date || value instanceof Error || value === null || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      sensitiveKey(key) ? REDACTED : redactForLogging(entry),
+    ]),
+  );
+}
+
 const replicaNumber = process.env.REPLICA_NUMBER;
 const logFileName = replicaNumber ? `logs/payjoin-${replicaNumber}.log` : "logs/payjoin.log";
 
@@ -43,6 +70,8 @@ function logToTransport(logObject: ILogObj): void {
 // Use default tslog configuration for pretty console output
 const originalLogger = new Logger();
 
+(originalLogger as unknown as { stackDepthLevel: number }).stackDepthLevel += 1;
+
 const logMethods = ['silly', 'trace', 'debug', 'info', 'warn', 'error', 'fatal'];
 
 const logger = new Proxy(originalLogger, {
@@ -54,7 +83,7 @@ const logger = new Proxy(originalLogger, {
           if (typeof arg === 'function') {
             return arg.name ? `${arg.name}()` : 'anonymous()';
           }
-          return JSON.parse(Utils.jsonStringify(arg));
+          return JSON.parse(Utils.jsonStringify(redactForLogging(arg)));
         });
 
         return (target as any)[prop](...processedArgs);

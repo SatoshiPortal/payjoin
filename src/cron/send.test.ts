@@ -9,7 +9,7 @@ import { Prisma } from '@prisma/client';
 // payjoin is an ESM package — mock it so Jest can parse send.ts without issues.
 // validateAndBroadcastPayjoinPsbt doesn't use the SDK at all, so an empty mock
 // is sufficient for these tests.
-jest.mock('payjoin', () => ({ payjoin: {} }));
+jest.mock('payjoin', () => ({ payjoin: { replaySenderEventLog: jest.fn() } }));
 
 jest.mock('../lib/globals', () => ({
   cnClient: {
@@ -17,6 +17,9 @@ jest.mock('../lib/globals', () => ({
     finalizePsbt: jest.fn(),
     sendRawTransaction: jest.fn(),
     decodePsbt: jest.fn(),
+    decodeRawTransaction: jest.fn(),
+    getTransaction: jest.fn(),
+    testMempoolAccept: jest.fn(),
     lockUnspent: jest.fn(),
   },
   syncCnClient: {
@@ -30,8 +33,14 @@ jest.mock('../lib/db', () => ({
     send: {
       update: jest.fn().mockResolvedValue({}),
       findMany: jest.fn().mockResolvedValue([]),
+      findUnique: jest.fn().mockResolvedValue(null),
     },
   },
+}));
+
+// only reached by recoverFallbackTxHex(), for rows predating fallbackTxHex
+jest.mock('../lib/persister', () => ({
+  SenderPersister: jest.fn().mockImplementation(() => ({ restore: jest.fn() })),
 }));
 
 jest.mock('../lib/Log2File', () => ({
@@ -50,6 +59,8 @@ jest.mock('../lib/Log2File', () => ({
 const { cnClient } = require('../lib/globals');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { db } = require('../lib/db');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { payjoin: payjoinSdk } = require('payjoin');
 
 const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE'> = {
   SEND_WALLET: '01',
@@ -65,6 +76,9 @@ const PROPOSAL_PSBT = 'cHNidP8BAH0CAAAAA...proposal';
 const SIGNED_PSBT   = 'cHNidP8BAH0CAAAAA...signed';
 const TX_HEX        = 'deadbeef01020304';
 const FAKE_TXID     = 'abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234';
+// the sender's signed original, stored at createSender() time
+const FALLBACK_HEX  = '0200000001aabbccdd00000000';
+const FALLBACK_TXID = 'beef5678beef5678beef5678beef5678beef5678beef5678beef5678beef5678';
 
 /**
  * Set up the happy-path chain of cnClient mocks.
@@ -284,27 +298,35 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
 
   const LOCKED = [{ txid: 'a'.repeat(64), vout: 0 }, { txid: 'b'.repeat(64), vout: 1 }];
 
+  // Cancelled rows take the pure-release path (never broadcast), which is what
+  // this block is about — the expiry/fallback path has its own block below.
+  function cancelledRow(id: number, lockedInputs: unknown) {
+    return { id, lockedInputs, cancelledTs: new Date(), txid: null, address: 'bc1qsender', session: null, fallbackTxHex: null };
+  }
+
   // first findMany call = active sessions to restore (always empty here, so
   // processSendSession/the payjoin SDK is never touched); second call = the
-  // stuck-sends release query.
-  function mockStuckSends(rows: Array<{ id: number; lockedInputs: unknown }>) {
+  // stuck-sends sweep. processTerminalSend re-reads each row under the lock,
+  // so findUnique must resolve the same rows by id.
+  function mockStuckSends(rows: Array<Record<string, unknown> & { id: number }>) {
     db.send.findMany
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce(rows);
+    db.send.findUnique.mockImplementation(
+      ({ where }: { where: { id: number } }) => Promise.resolve(rows.find(r => r.id === where.id) ?? null)
+    );
   }
 
-  it('scopes the release query to unbroadcast, terminal rows with recorded locked inputs', async () => {
+  it('scopes the sweep query to unbroadcast, terminal rows with recorded locked inputs', async () => {
     mockStuckSends([]);
 
     await restoreSendSessions(mockConfig as Config);
 
     expect(db.send.findMany).toHaveBeenLastCalledWith({
       where: {
-        txid: null,
         lockedInputs: { not: Prisma.DbNull },
         OR: [{ cancelledTs: { not: null } }, { expiryTs: { lte: expect.any(Date) } }],
       },
-      select: { id: true, lockedInputs: true },
     });
   });
 
@@ -326,7 +348,7 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
   });
 
   it('releases exactly the recorded outpoints for a stuck send, then clears lockedInputs', async () => {
-    mockStuckSends([{ id: 42, lockedInputs: LOCKED }]);
+    mockStuckSends([cancelledRow(42, LOCKED)]);
     cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
 
     await restoreSendSessions(mockConfig as Config);
@@ -343,7 +365,7 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
   });
 
   it('never issues a blanket unlock — always passes the specific utxos array', async () => {
-    mockStuckSends([{ id: 42, lockedInputs: LOCKED }]);
+    mockStuckSends([cancelledRow(42, LOCKED)]);
     cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
 
     await restoreSendSessions(mockConfig as Config);
@@ -354,7 +376,7 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
   });
 
   it('retries next cycle without clearing lockedInputs when lockUnspent fails', async () => {
-    mockStuckSends([{ id: 42, lockedInputs: LOCKED }]);
+    mockStuckSends([cancelledRow(42, LOCKED)]);
     cnClient.lockUnspent.mockResolvedValue({ result: null, error: { code: -1, message: 'rpc error' } });
 
     await restoreSendSessions(mockConfig as Config);
@@ -362,11 +384,29 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
     expect(db.send.update).not.toHaveBeenCalled();
   });
 
+  // These locks are non-persistent, and the whole conflict path unlocks inputs
+  // a competing tx already spent — both make Core refuse the unlock. Retrying
+  // a lock that can never be taken again would strand the row forever.
+  it.each([
+    ['Invalid parameter, expected unspent output'],
+    ['Invalid parameter, expected locked output'],
+  ])('counts an already-gone outpoint (%s) as released', async (message) => {
+    mockStuckSends([cancelledRow(42, LOCKED)]);
+    cnClient.lockUnspent.mockResolvedValue({ result: null, error: { code: -32603, message } });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { lockedInputs: Prisma.DbNull },
+    });
+  });
+
   it('releases multiple stuck sends independently, each with its own outpoints', async () => {
     const otherLocked = [{ txid: 'c'.repeat(64), vout: 3 }];
     mockStuckSends([
-      { id: 42, lockedInputs: LOCKED },
-      { id: 43, lockedInputs: otherLocked },
+      cancelledRow(42, LOCKED),
+      cancelledRow(43, otherLocked),
     ]);
     cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
 
@@ -380,7 +420,7 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
   });
 
   it('skips a row with no locked inputs recorded (malformed/empty) without calling lockUnspent', async () => {
-    mockStuckSends([{ id: 42, lockedInputs: [] }]);
+    mockStuckSends([cancelledRow(42, [])]);
 
     await restoreSendSessions(mockConfig as Config);
 
@@ -395,5 +435,322 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
 
     expect(cnClient.lockUnspent).not.toHaveBeenCalled();
     expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('never broadcasts for a cancelled send — the user asked for the payment not to happen', async () => {
+    mockStuckSends([{ ...cancelledRow(42, LOCKED), fallbackTxHex: FALLBACK_HEX }]);
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.getTransaction).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ unlock: true, utxos: LOCKED }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The reason this sweep exists: we hand the receiver a signed original and
+// rely on them to broadcast it when the payjoin fails. Receiver wallets do not
+// reliably do that, so before giving the inputs back we ask Cyphernode whether
+// anything spending them ever reached the network, and broadcast it ourselves
+// if not.
+// ---------------------------------------------------------------------------
+
+describe('processTerminalSend — fallback broadcast before releasing locks', () => {
+
+  const LOCKED = [{ txid: 'a'.repeat(64), vout: 0 }];
+
+  function expiredRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 42,
+      lockedInputs: LOCKED,
+      cancelledTs: null,
+      expiryTs: new Date(Date.now() - 7200 * 1000),
+      txid: null,
+      address: 'bc1qsender',
+      session: null,
+      fallbackTxHex: FALLBACK_HEX,
+      ...overrides,
+    };
+  }
+
+  function mockSweep(rows: Array<Record<string, unknown>>) {
+    db.send.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+    db.send.findUnique.mockImplementation(
+      ({ where }: { where: { id: number } }) => Promise.resolve(rows.find(r => r.id === where.id) ?? null)
+    );
+  }
+
+  // bitcoind's "No such mempool or blockchain transaction"
+  const NOT_FOUND = { result: null, error: { code: -5, message: 'No such mempool or blockchain transaction' } };
+
+  beforeEach(() => {
+    cnClient.decodeRawTransaction.mockResolvedValue({ result: { tx: { txid: FALLBACK_TXID } }, error: null });
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true }, error: null });
+    // nothing else spends the inputs unless a test says otherwise
+    cnClient.testMempoolAccept.mockResolvedValue({ result: [{ txid: FALLBACK_TXID, allowed: true }], error: null });
+  });
+
+  it('broadcasts the stored original when Cyphernode knows of no such tx, and records it as a fallback', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.sendRawTransaction.mockResolvedValue({ result: FALLBACK_TXID, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).toHaveBeenCalledWith({
+      hex: FALLBACK_HEX,
+      wallet: mockConfig.SEND_WALLET,
+    });
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { txid: FALLBACK_TXID, fallbackTs: expect.any(Date), lockedInputs: Prisma.DbNull },
+    });
+    // the inputs are spent by the broadcast — no unlock needed
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+  });
+
+  it('does not broadcast when the tx is already on the network — records it and leaves the locks to the spend', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue({ result: { txid: FALLBACK_TXID, confirmations: 0 }, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { txid: FALLBACK_TXID, fallbackTs: expect.any(Date), lockedInputs: Prisma.DbNull },
+    });
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+  });
+
+  // The txid lookup only ever asks about OUR original. If the receiver
+  // broadcast the payjoin and the watch callback has not caught up, that tx's
+  // txid is unknown to us — testmempoolaccept is what surfaces it.
+  it('detects a conflicting tx we have no txid for and releases instead of broadcasting', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.testMempoolAccept.mockResolvedValue({
+      result: [{ txid: FALLBACK_TXID, allowed: false, 'reject-reason': 'txn-mempool-conflict' }],
+      error: null,
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ unlock: true, utxos: LOCKED }));
+    expect(db.send.update).toHaveBeenCalledWith({ where: { id: 42 }, data: { lockedInputs: Prisma.DbNull } });
+  });
+
+  it('detects inputs spent by a confirmed tx via missing-inputs and releases without broadcasting', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.testMempoolAccept.mockResolvedValue({
+      result: [{ txid: FALLBACK_TXID, allowed: false, 'reject-reason': 'missing-inputs' }],
+      error: null,
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ unlock: true, utxos: LOCKED }));
+  });
+
+  it('records rather than rebroadcasts when the node already knows the original', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.testMempoolAccept.mockResolvedValue({
+      result: [{ txid: FALLBACK_TXID, allowed: false, 'reject-reason': 'txn-already-in-mempool' }],
+      error: null,
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { txid: FALLBACK_TXID, fallbackTs: expect.any(Date), lockedInputs: Prisma.DbNull },
+    });
+  });
+
+  it('defers when the mempool-acceptance test itself fails — keeps the locks', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.testMempoolAccept.mockResolvedValue({ result: null, error: { code: -32603, message: 'ECONNREFUSED' } });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  // Core reaches "insufficient fee" only on the replacement path, so it means
+  // a conflicting tx already holds these inputs — it reads like a fee problem
+  // but deferring on it retries a doomed broadcast forever. This is the exact
+  // reject-reason regtest produced for a conflicted send.
+  it.each([
+    ['insufficient fee'],
+    ['insufficient fee, rejecting replacement 6f1a; new feerate 1.00 BTC/kvB <= old feerate 2.00 BTC/kvB'],
+  ])('treats %# "insufficient fee" as a conflict, not a transient fee failure', async (reason) => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.testMempoolAccept.mockResolvedValue({
+      result: [{ txid: FALLBACK_TXID, allowed: false, 'reject-reason': reason }],
+      error: null,
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ unlock: true, utxos: LOCKED }));
+    expect(db.send.update).toHaveBeenCalledWith({ where: { id: 42 }, data: { lockedInputs: Prisma.DbNull } });
+  });
+
+  it('defers on a non-conflict rejection such as a fee-policy failure', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.testMempoolAccept.mockResolvedValue({
+      result: [{ txid: FALLBACK_TXID, allowed: false, 'reject-reason': 'min relay fee not met' }],
+      error: null,
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('defers on an ambiguous lookup failure: no broadcast, no release, no DB write — retried next cycle', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue({ result: null, error: { code: -32603, message: 'connect ECONNREFUSED' } });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('releases the locks when the inputs are already spent by a conflicting tx', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.sendRawTransaction.mockResolvedValue({
+      result: null,
+      error: { code: -25, message: 'bad-txns-inputs-missingorspent' },
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ unlock: true, utxos: LOCKED }));
+    expect(db.send.update).toHaveBeenCalledWith({ where: { id: 42 }, data: { lockedInputs: Prisma.DbNull } });
+  });
+
+  it('records the send when the broadcast races the receiver and loses (already known)', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.sendRawTransaction.mockResolvedValue({
+      result: null,
+      error: { code: -27, message: 'Transaction already in block chain' },
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { txid: FALLBACK_TXID, fallbackTs: expect.any(Date), lockedInputs: Prisma.DbNull },
+    });
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+  });
+
+  it('keeps the locks and retries next cycle on a transient broadcast failure', async () => {
+    mockSweep([expiredRow()]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.sendRawTransaction.mockResolvedValue({
+      result: null,
+      error: { code: -26, message: 'min relay fee not met' },
+    });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).not.toHaveBeenCalled();
+  });
+
+  it('releases without broadcasting when no fallback tx can be recovered at all', async () => {
+    mockSweep([expiredRow({ fallbackTxHex: null, session: null })]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).toHaveBeenCalledWith(expect.objectContaining({ unlock: true, utxos: LOCKED }));
+  });
+
+  it('recovers the fallback tx from the SDK session history for rows written before fallbackTxHex existed', async () => {
+    mockSweep([expiredRow({ fallbackTxHex: null, session: '[]' })]);
+    // 0xde 0xad 0xbe 0xef
+    const fallbackBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]).buffer;
+    payjoinSdk.replaySenderEventLog.mockReturnValue({
+      sessionHistory: () => ({ fallbackTx: () => fallbackBytes }),
+    });
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.sendRawTransaction.mockResolvedValue({ result: FALLBACK_TXID, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    // persisted so the next cycle does not have to replay the event log
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { fallbackTxHex: 'deadbeef' },
+    });
+    expect(cnClient.sendRawTransaction).toHaveBeenCalledWith({
+      hex: 'deadbeef',
+      wallet: mockConfig.SEND_WALLET,
+    });
+  });
+
+  it('never re-broadcasts or unlocks a send whose tx already landed — only clears the stale lock record', async () => {
+    // a payjoin txid, not our original
+    mockSweep([expiredRow({ txid: 'f'.repeat(64) })]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.getTransaction).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { lockedInputs: Prisma.DbNull },
+    });
+  });
+
+  // The case the whole feature is about when the receiver DOES do its job: the
+  // address watch records the txid without knowing whose tx it is, so without
+  // this the payment would be reported as an ordinary send.
+  it('labels a receiver-broadcast original as a fallback when the watch callback recorded it first', async () => {
+    mockSweep([expiredRow({ txid: FALLBACK_TXID })]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+    expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { lockedInputs: Prisma.DbNull, fallbackTs: expect.any(Date) },
+    });
+  });
+
+  it('does not re-stamp fallbackTs on a send already marked as a fallback', async () => {
+    mockSweep([expiredRow({ txid: FALLBACK_TXID, fallbackTs: new Date() })]);
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.decodeRawTransaction).not.toHaveBeenCalled();
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { lockedInputs: Prisma.DbNull },
+    });
   });
 });

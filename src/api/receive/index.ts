@@ -1,6 +1,6 @@
 import { addJsonRpcMethod } from "..";
 import { IReqReceive, IRespReceive } from "../../types/api/receive";
-import { isValidAddress, isValidAmount } from "../../lib/validate";
+import { isOwnedAddress, isValidAddress, isValidAmount } from "../../lib/validate";
 import logger from "../../lib/Log2File";
 import { JSONRPCErrorCode, JSONRPCErrorException } from "json-rpc-2.0";
 import { appendReceiveStatus, createReceiver } from "../../lib/payjoin";
@@ -8,6 +8,7 @@ import { config } from "../../config";
 import { db } from "../../lib/db";
 import { addressCallbackUrl } from "../callback";
 import { lock, cnClient } from "../../lib/globals";
+import { randomBytes } from "crypto";
 
 export function registerReceiveApi(): void {
   addJsonRpcMethod('receive', receive);
@@ -17,6 +18,10 @@ export function registerReceiveApi(): void {
 
 export async function receive(params: IReqReceive): Promise<IRespReceive> {
   logger.info(receive, params);
+
+  // Only a caller-supplied address needs the ownership check below; one we derive
+  // ourselves comes from RECEIVE_WALLET by construction.
+  const callerSuppliedAddress = !!params.address;
 
   if (!params.address) {
     // Force bech32 to match the mobile wallet's bip84 default.
@@ -34,6 +39,13 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
     throw new JSONRPCErrorException('Invalid address', JSONRPCErrorCode.InvalidParams);
   }
 
+  // The payjoin adds one of our wallet UTXOs to the output paying this address,
+  // so accepting an address we don't own hands that UTXO to the caller.
+  if (callerSuppliedAddress && !(await isOwnedAddress(params.address))) {
+    logger.error(receive, 'rejecting receive address not owned by a configured wallet:', params.address);
+    throw new JSONRPCErrorException('Address is not owned by a configured wallet', JSONRPCErrorCode.InvalidParams);
+  }
+
   if (!isValidAmount(params.amount)) {
     throw new JSONRPCErrorException('Invalid amount', JSONRPCErrorCode.InvalidParams);
   }
@@ -43,6 +55,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
       amount: params.amount,
       address: params.address,
       callbackUrl: params.callbackUrl,
+      callbackToken: randomBytes(32).toString("hex"),
       expiryTs: new Date(Date.now() + Number(config.PAYJOIN_RECEIVE_EXPIRY) * 1000),
     }
 
@@ -59,7 +72,7 @@ export async function receive(params: IReqReceive): Promise<IRespReceive> {
     });
 
     // watch the address for non-payjoin transactions
-    const watchUrl = addressCallbackUrl('receive', params.address);
+    const watchUrl = addressCallbackUrl('receive', params.address, receive.callbackToken!);
     await cnClient.watch({
       address: params.address,
       unconfirmedCallbackURL: watchUrl,
@@ -111,7 +124,7 @@ async function cancelReceive(params: { id: number }): Promise<{ id: number }> {
         }
 
         // stop watching the address
-        const watchUrl = addressCallbackUrl('receive', receive.address);
+        const watchUrl = addressCallbackUrl('receive', receive.address, receive.callbackToken);
         await cnClient.unwatch({
           address: receive.address,
           unconfirmedCallbackURL: watchUrl,

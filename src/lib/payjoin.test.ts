@@ -21,6 +21,7 @@ jest.mock('./globals', () => ({
     createFundedPsbt: jest.fn(),
     decodePsbt: jest.fn(),
     processPsbt: jest.fn(),
+    finalizePsbt: jest.fn(),
   },
   syncCnClient: {},
   lock: {},
@@ -82,6 +83,7 @@ function makeReceive(overrides: Partial<Receive> = {}): Receive {
     reservedInputTxid: null,
     reservedInputVout: null,
     callbackUrl: null,
+    callbackToken: null,
     calledBackTs: null,
     expiryTs: null,
     cancelledTs: null,
@@ -111,16 +113,19 @@ function makeSend(overrides: Partial<Send> = {}): Send {
     txInputs: null,
     txOutputs: null,
     lockedInputs: null,
+    fallbackTxHex: null,
     txid: null,
     address: 'bc1qtest',
     fee: null,
     senderFee: null,
     callbackUrl: null,
+    callbackToken: null,
     calledBackTs: null,
     expiryTs: null,
     cancelledTs: null,
     session: null,
     ohttpRelay: null,
+    fallbackTs: null,
     confirmedTs: null,
     createdTs: new Date(),
     updatedTs: new Date(),
@@ -462,11 +467,14 @@ describe('extractCommittedInputs', () => {
   const ev = (obj: unknown) => JSON.stringify(obj);
 
   const commitEvent = (prevouts: string[]) => ev({
-    CommittedInputs: prevouts.map((previous_output) => ({
-      txin: { previous_output, script_sig: '', sequence: 0, witness: [] },
-      psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
-      expected_weight: 272,
-    })),
+    CommittedInputs: {
+      receiver_inputs: prevouts.map((previous_output) => ({
+        txin: { previous_output, script_sig: '', sequence: 0, witness: [] },
+        psbtin: { witness_utxo: { value: 100000, script_pubkey: 'bb' } },
+        expected_weight: 272,
+      })),
+      payjoin_psbt: {},
+    },
   });
 
   it('returns the outpoint from a CommittedInputs event', () => {
@@ -492,13 +500,13 @@ describe('extractCommittedInputs', () => {
   });
 
   it('tolerates already-parsed object events', () => {
-    const events = [{ CommittedInputs: [{ txin: { previous_output: `${TXID}:5` } }] }];
+    const events = [{ CommittedInputs: { receiver_inputs: [{ txin: { previous_output: `${TXID}:5` } }] } }];
     expect(extractCommittedInputs(events)).toEqual([{ txid: TXID, vout: 5 }]);
   });
 
   it('fails loudly (undefined) on an unexpected outpoint shape', () => {
     // struct-shaped previous_output (non-human-readable serde) must not be silently dropped
-    const events = [ev({ CommittedInputs: [{ txin: { previous_output: { txid: TXID, vout: 1 } } }] })];
+    const events = [ev({ CommittedInputs: { receiver_inputs: [{ txin: { previous_output: { txid: TXID, vout: 1 } } }] } })];
     expect(extractCommittedInputs(events)).toBeUndefined();
     // malformed txid
     expect(extractCommittedInputs([commitEvent(['nothex:1'])])).toBeUndefined();
@@ -542,6 +550,30 @@ describe('appendReceiveStatus — reservation fields are internal', () => {
 });
 
 // ---------------------------------------------------------------------------
+// callbackToken is the watch-callback capability secret. Anything that can reach
+// the API can also reach the callback route, so disclosing it through an API
+// response or an outbound webhook hands back the forgery capability the token
+// exists to remove (audit Finding 2).
+// ---------------------------------------------------------------------------
+
+describe('callbackToken is never disclosed', () => {
+  const TOKEN = 'f'.repeat(64);
+
+  it('omits callbackToken from receive API responses and webhook payloads', () => {
+    const result = appendReceiveStatus(makeReceive({ callbackToken: TOKEN }));
+    expect(result).not.toHaveProperty('callbackToken');
+    // also catches the token being carried under any other key
+    expect(Object.values(result)).not.toContain(TOKEN);
+  });
+
+  it('omits callbackToken from send API responses and webhook payloads', () => {
+    const result = appendSendStatus(makeSend({ callbackToken: TOKEN }));
+    expect(result).not.toHaveProperty('callbackToken');
+    expect(Object.values(result)).not.toContain(TOKEN);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // createSender — locked inputs recorded so restoreSendSessions can release
 // them precisely later (no matching release existed at all previously)
 // ---------------------------------------------------------------------------
@@ -553,6 +585,8 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     { txid: 'a'.repeat(64), vout: 0, scriptSig: { asm: '', hex: '' }, txinwitness: [], sequence: 0 },
     { txid: 'b'.repeat(64), vout: 2, scriptSig: { asm: '', hex: '' }, txinwitness: [], sequence: 0 },
   ];
+
+  const FALLBACK_HEX = '0200000001aabbccdd00000000';
 
   function rawTxWithVin(vin: typeof LOCKED_VIN) {
     return {
@@ -567,6 +601,7 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     cnClient.createFundedPsbt.mockResolvedValue({ result: { psbt: FUNDED_PSBT, fee: 0.00001, changepos: 1 }, error: null });
     cnClient.decodePsbt.mockResolvedValue({ result: { inputs: [], outputs: [], tx: rawTxWithVin(LOCKED_VIN) }, error: null });
     cnClient.processPsbt.mockResolvedValue({ result: { psbt: 'signed', complete: true }, error: null });
+    cnClient.finalizePsbt.mockResolvedValue({ result: { hex: FALLBACK_HEX, psbt: 'signed' }, error: null });
   }
 
   beforeEach(() => jest.clearAllMocks());
@@ -593,7 +628,35 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
 
     await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
 
-    expect(callOrder).toEqual(['db.send.update', 'processPsbt']);
+    // the trailing update is the fallback tx hex, recorded only once the
+    // original is signed — the lockedInputs write must still come first
+    expect(callOrder).toEqual(['db.send.update', 'processPsbt', 'db.send.update']);
+  });
+
+  it('records the signed original as fallbackTxHex so the expiry sweep can broadcast it', async () => {
+    setupHappyPath();
+
+    await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
+
+    expect(cnClient.finalizePsbt).toHaveBeenCalledWith(
+      expect.objectContaining({ psbt: 'signed', extract: true }),
+    );
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 7 },
+      data: { fallbackTxHex: FALLBACK_HEX },
+    });
+  });
+
+  it('still returns a usable sender when the fallback tx hex cannot be extracted', async () => {
+    setupHappyPath();
+    cnClient.finalizePsbt.mockResolvedValue({ result: null, error: { code: -1, message: 'extract failed' } });
+
+    const { psbt } = await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
+
+    expect(psbt).toBe('signed');
+    expect(db.send.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ fallbackTxHex: expect.anything() }) }),
+    );
   });
 
   it('throws and never records lockedInputs when createFundedPsbt itself fails (nothing was locked)', async () => {

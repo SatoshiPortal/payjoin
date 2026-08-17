@@ -8,6 +8,7 @@ import { config } from "../../config";
 import { db } from "../../lib/db";
 import { addressCallbackUrl } from "../callback";
 import { lock, cnClient } from "../../lib/globals";
+import { randomBytes } from "crypto";
 
 export function registerSendApi(): void {
   addJsonRpcMethod('send', send);
@@ -57,6 +58,7 @@ export async function send(params: IReqSend): Promise<IRespSend> {
       amount,
       address,
       callbackUrl: params.callbackUrl,
+      callbackToken: randomBytes(32).toString("hex"),
       expiryTs: expiry,
     }
 
@@ -66,7 +68,7 @@ export async function send(params: IReqSend): Promise<IRespSend> {
     logger.debug('psbt:', psbt);
 
     // watch the address for non-payjoin transactions
-    const watchUrl = addressCallbackUrl('send', address);
+    const watchUrl = addressCallbackUrl('send', address, sendRecord.callbackToken!);
     await cnClient.watch({
       address,
       unconfirmedCallbackURL: watchUrl,
@@ -122,7 +124,7 @@ async function cancelSend(params: { id: number }): Promise<{ id: number }> {
         }
 
         // stop watching the address
-        const watchUrl = addressCallbackUrl('send', send.address!);
+        const watchUrl = addressCallbackUrl('send', send.address!, send.callbackToken);
         await cnClient.unwatch({
           address: send.address!,
           unconfirmedCallbackURL: watchUrl,

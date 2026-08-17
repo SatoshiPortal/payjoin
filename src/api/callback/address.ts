@@ -115,10 +115,14 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       // and from there the two directions diverge:
       //   receive — an underpayment is a payment the operator accepts, so it is logged
       //             and then recorded with the Cyphernode-derived amount and reported on;
-      //   send    — a genuine proposal never pays the payee less than the bip21 amount
-      //             (the SDK forbids decreasing that output, and the receiver adding an
-      //             input only raises it), so a shortfall is not our payment at all and
-      //             must not touch the record.
+      //   send    — a genuine proposal usually pays the payee at least the bip21 amount,
+      //             but when the sender offered no fee_contribution and the payee output
+      //             is the receiver's only output, a compliant receiver may shave its own
+      //             fee rate top-up off that same output rather than off the sender. That
+      //             case is already ours: validateAndBroadcastPayjoinPsbt recorded this
+      //             exact txid the moment we signed and broadcast it ourselves, so an
+      //             underpayment against a txid we don't already recognize is the only
+      //             one that must not touch the record.
       // Either way the Cyphernode-derived total is what gets written below, never the claim.
       const paidAmount = amountPaidToAddress(transaction, payjoin.address);
       if (paidAmount === 0n) {
@@ -127,7 +131,7 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       }
       if (paidAmount < payjoin.amount) {
         logger.warn(handleAddressCallback, `callback transaction underpays ${type} address: ${data.address}: paid ${paidAmount} of ${payjoin.amount}`);
-        if (type === "send") return;
+        if (type === "send" && data.txid !== payjoin.txid) return;
       }
 
       // Cyphernode is authoritative and is what drives confirmedTs below, so the

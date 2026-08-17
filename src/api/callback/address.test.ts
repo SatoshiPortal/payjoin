@@ -483,8 +483,8 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     });
   });
 
-  it('rejects an underpaying send even though underpaid receives remain reportable', async () => {
-    const row = makeReceiveRow({ txid: REAL_TXID, amount: 100_000n });
+  it('rejects an underpaying send claimed against a txid we never broadcast (the forgery case)', async () => {
+    const row = makeReceiveRow({ txid: GUESSED_TXID, amount: 100_000n });
     db.send.findFirst.mockResolvedValue(row);
     cnClient.getTransaction.mockResolvedValue({
       result: {
@@ -499,5 +499,30 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     expect(db.send.update).not.toHaveBeenCalled();
     expect(Utils.post).not.toHaveBeenCalled();
     expect(cnClient.unwatch).not.toHaveBeenCalled();
+  });
+
+  // A shortfall against the txid validateAndBroadcastPayjoinPsbt already recorded is not a
+  // forged claim — it's our own signed, broadcast proposal, and (with no fee_contribution
+  // offered) the receiver is allowed to shave its fee-rate top-up off its own payee output
+  // rather than the sender's. That must still be recorded and reported, confirmations and all.
+  it('records an underpaying send when it matches the txid we already broadcast ourselves', async () => {
+    const row = makeReceiveRow({ txid: REAL_TXID, amount: 100_000n });
+    db.send.findFirst.mockResolvedValue(row);
+    db.send.update.mockResolvedValue({ ...row, confirmedTs: new Date() });
+    cnClient.getTransaction.mockResolvedValue({
+      result: {
+        txid: REAL_TXID,
+        confirmations: 1,
+        vout: [{ value: 0.0005, scriptPubKey: { address: RECEIVE_ADDRESS } }],
+      },
+    });
+
+    await handleAddressCallback(webhookData({ txid: REAL_TXID, confirmations: 1 }), 'send', CALLBACK_TOKEN);
+
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: row.id },
+      data: expect.objectContaining({ txid: REAL_TXID, confirmedTs: expect.any(Date) }),
+    });
+    expect(cnClient.unwatch).toHaveBeenCalled();
   });
 });

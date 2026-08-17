@@ -70,6 +70,8 @@ function logToTransport(logObject: ILogObj): void {
 // Use default tslog configuration for pretty console output
 const originalLogger = new Logger();
 
+(originalLogger as unknown as { stackDepthLevel: number }).stackDepthLevel += 1;
+
 const logMethods = ['silly', 'trace', 'debug', 'info', 'warn', 'error', 'fatal'];
 
 const logger = new Proxy(originalLogger, {

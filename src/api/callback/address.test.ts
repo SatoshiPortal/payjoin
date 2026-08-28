@@ -483,6 +483,44 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     });
   });
 
+  // The webhook used to build every payload with appendReceiveStatus. On a send row that
+  // reports the 0-conf window as "pending" (unconfirmed gates on the receive-only firstSeenTs)
+  // and puts the signed fallback tx on the wire, which appendSendStatus deliberately strips.
+  it('reports a broadcast, unconfirmed send as "unconfirmed" rather than "pending"', async () => {
+    const row = makeReceiveRow({ txid: REAL_TXID, confirmedTs: null });
+    db.send.findFirst.mockResolvedValue(row);
+    db.send.update.mockResolvedValue({ ...row, txid: REAL_TXID });
+
+    await handleAddressCallback(webhookData({ txid: REAL_TXID }), 'send', CALLBACK_TOKEN);
+
+    expect(Utils.post).toHaveBeenCalled();
+    expect((Utils.post as jest.Mock).mock.calls[0][1]).toMatchObject({ status: 'unconfirmed' });
+  });
+
+  it('never sends the signed fallback tx to a send webhook endpoint', async () => {
+    const fallbackTxHex = '0200000001aabbccdd00000000';
+    const row = makeReceiveRow({ txid: REAL_TXID, fallbackTxHex });
+    db.send.findFirst.mockResolvedValue(row);
+    db.send.update.mockResolvedValue({ ...row });
+
+    await handleAddressCallback(webhookData({ txid: REAL_TXID }), 'send', CALLBACK_TOKEN);
+
+    expect(Utils.post).toHaveBeenCalled();
+    const postData = (Utils.post as jest.Mock).mock.calls[0][1];
+    expect(postData).not.toHaveProperty('fallbackTxHex');
+    expect(JSON.stringify(postData)).not.toContain(fallbackTxHex);
+  });
+
+  it('still reports a send fallback broadcast as "fallback"', async () => {
+    const row = makeReceiveRow({ txid: REAL_TXID, fallbackTs: new Date() });
+    db.send.findFirst.mockResolvedValue(row);
+    db.send.update.mockResolvedValue({ ...row });
+
+    await handleAddressCallback(webhookData({ txid: REAL_TXID }), 'send', CALLBACK_TOKEN);
+
+    expect((Utils.post as jest.Mock).mock.calls[0][1]).toMatchObject({ status: 'fallback' });
+  });
+
   it('rejects an underpaying send claimed against a txid we never broadcast (the forgery case)', async () => {
     const row = makeReceiveRow({ txid: GUESSED_TXID, amount: 100_000n });
     db.send.findFirst.mockResolvedValue(row);

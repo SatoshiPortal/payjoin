@@ -2,9 +2,9 @@ import { config } from "../../config";
 import { db } from "../../lib/db";
 import logger from "../../lib/Log2File";
 import Utils from "../../lib/Utils";
-import { appendReceiveStatus } from "../../lib/payjoin";
+import { appendReceiveStatus, appendSendStatus } from "../../lib/payjoin";
 import { lock, cnClient } from "../../lib/globals";
-import { Receive } from "@prisma/client";
+import { Receive, Send } from "@prisma/client";
 
 export function addressCallbackUrl(type: "send" | "receive", address: string, token?: string | null) {
   const baseUrl = `${config.URL_SERVER}:${config.URL_PORT}/${type}/address/${address}`;
@@ -181,7 +181,7 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
         // send the callback data
         if (payjoin.callbackUrl) {
           const postData = Utils.sanitizeResponse(
-            appendReceiveStatus(updatedPayjoin as unknown as Parameters<typeof appendReceiveStatus>[0])
+            appendReceiveStatus(updatedPayjoin as Receive)
           )
           if (await Utils.post(payjoin.callbackUrl, postData)) {
             logger.info(handleAddressCallback, "callback sent to:", payjoin.callbackUrl);
@@ -219,7 +219,9 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       // send the callback data
       if (updatedPayjoin.callbackUrl) {
         const postData = Utils.sanitizeResponse(
-          appendReceiveStatus(updatedPayjoin as unknown as Parameters<typeof appendReceiveStatus>[0])
+          type === "send"
+            ? appendSendStatus(updatedPayjoin as Send)
+            : appendReceiveStatus(updatedPayjoin as Receive)
         )
         if (await Utils.post(updatedPayjoin.callbackUrl, postData)) {
           logger.info(handleAddressCallback, "callback sent to:", updatedPayjoin.callbackUrl);

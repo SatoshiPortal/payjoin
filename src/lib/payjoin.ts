@@ -400,6 +400,13 @@ export function appendReceiveStatus(receive: Receive) {
   } as IRespReceive;
 }
 
+// we stop attempting the payjoin at our own cutoff, since the receiver's BIP21 expiry is often 24h+
+export function sendPayjoinDeadline(send: Pick<Send, 'createdTs' | 'expiryTs'>): Date {
+  const cutoff = new Date(send.createdTs.getTime() + config.SEND_PAYJOIN_CUTOFF * 1000);
+  if (!send.expiryTs) return cutoff;
+  return send.expiryTs < cutoff ? send.expiryTs : cutoff;
+}
+
 export function appendSendStatus(send: Send) {
   let status = SendStatus.Pending;
   if (send.cancelledTs) {
@@ -410,7 +417,7 @@ export function appendSendStatus(send: Send) {
     status = SendStatus.Fallback;
   } else if (send.txid) {
     status = SendStatus.Unconfirmed;
-  } else if (!send.txid && !send.confirmedTs && send.expiryTs && send.expiryTs < new Date()) {
+  } else if (!send.txid && !send.confirmedTs && sendPayjoinDeadline(send) < new Date()) {
     status = SendStatus.Expired;
   }
 

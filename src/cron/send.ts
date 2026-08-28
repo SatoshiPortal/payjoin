@@ -22,6 +22,9 @@ export async function restoreSendSessions(config: Config) {
       expiryTs: {
         gt: new Date()
       },
+      createdTs: {
+        gt: new Date(Date.now() - config.SEND_PAYJOIN_CUTOFF * 1000)
+      },
       session: { not: null },
     }
   });
@@ -288,7 +291,8 @@ function isAddressOwned(address: string, config: Config): boolean {
  * Resolve every terminal send still holding inputs from createSender().
  *
  * Expiry alone gets RESERVATION_RELEASE_GRACE first: the original may still be
- * a counterparty's fallback tx in flight. Cancellation releases immediately.
+ * a counterparty's fallback tx in flight. Cancellation releases immediately, and
+ * so does SEND_PAYJOIN_CUTOFF, which fires before the receiver considers us expired.
  */
 export async function sweepTerminalSends(config: Config) {
   const { replicaId, totalReplicas } = Utils.replicaInfo();
@@ -297,11 +301,18 @@ export async function sweepTerminalSends(config: Config) {
   // records whatever lands without knowing whether it was the payjoin or the
   // receiver finally broadcasting our original, so those rows still need their
   // lock bookkeeping settled — and labelling, if the tx turns out to be ours.
-  const graceExpiredBefore = new Date(Date.now() - config.RESERVATION_RELEASE_GRACE * 1000);
+  const now = Date.now();
+  const graceExpiredBefore = new Date(now - config.RESERVATION_RELEASE_GRACE * 1000);
+  const cutoffBefore = new Date(now - config.SEND_PAYJOIN_CUTOFF * 1000);
   const allStuckSends = await db.send.findMany({
     where: {
       lockedInputs: { not: Prisma.DbNull },
-      OR: [{ cancelledTs: { not: null } }, { expiryTs: { lte: graceExpiredBefore } }],
+      OR: [
+        { cancelledTs: { not: null } },
+        { expiryTs: { lte: graceExpiredBefore } },
+        // our own cutoff is absolute: the grace only guards the receiver's post-expiry rebroadcast
+        { createdTs: { lte: cutoffBefore } },
+      ],
     },
   });
   // shard like every other sweep — processTerminalSend can now broadcast, so

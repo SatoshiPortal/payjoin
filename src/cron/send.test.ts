@@ -62,11 +62,12 @@ const { db } = require('../lib/db');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { payjoin: payjoinSdk } = require('payjoin');
 
-const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE'> = {
+const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE' | 'SEND_PAYJOIN_CUTOFF'> = {
   SEND_WALLET: '01',
   OHTTP_RELAYS: ['https://relay.example.com'],
   MAX_PAYJOIN_FEE_RATE: 500, // sat/vbyte — reject anything above this in tests
   RESERVATION_RELEASE_GRACE: 1800, // 30m
+  SEND_PAYJOIN_CUTOFF: 900, // 15m
 };
 
 const mockSendSess = { id: 1, amount: 100_000n }; // 100k sat payment
@@ -317,6 +318,18 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
     );
   }
 
+  it('stops polling a session once SEND_PAYJOIN_CUTOFF has passed since creation', async () => {
+    mockStuckSends([]);
+    const before = Date.now();
+
+    await restoreSendSessions(mockConfig as Config);
+
+    const { where } = db.send.findMany.mock.calls[0][0];
+    expect(where.expiryTs).toEqual({ gt: expect.any(Date) });
+    const cutoff = where.createdTs.gt.getTime();
+    expect(Math.abs(cutoff - (before - mockConfig.SEND_PAYJOIN_CUTOFF * 1000))).toBeLessThan(2000);
+  });
+
   it('scopes the sweep query to unbroadcast, terminal rows with recorded locked inputs', async () => {
     mockStuckSends([]);
 
@@ -325,7 +338,11 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
     expect(db.send.findMany).toHaveBeenLastCalledWith({
       where: {
         lockedInputs: { not: Prisma.DbNull },
-        OR: [{ cancelledTs: { not: null } }, { expiryTs: { lte: expect.any(Date) } }],
+        OR: [
+          { cancelledTs: { not: null } },
+          { expiryTs: { lte: expect.any(Date) } },
+          { createdTs: { lte: expect.any(Date) } },
+        ],
       },
     });
   });
@@ -345,6 +362,17 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
     const cutoff = expiryClause.expiryTs.lte.getTime();
     const expectedCutoff = before - mockConfig.RESERVATION_RELEASE_GRACE * 1000;
     expect(Math.abs(cutoff - expectedCutoff)).toBeLessThan(2000); // small tolerance for test execution time
+  });
+
+  it('sweeps on SEND_PAYJOIN_CUTOFF since creation with no grace added, independently of the bip21 expiry', async () => {
+    mockStuckSends([]);
+    const before = Date.now();
+
+    await restoreSendSessions(mockConfig as Config);
+
+    const { where } = db.send.findMany.mock.calls[db.send.findMany.mock.calls.length - 1][0];
+    const cutoff = where.OR[2].createdTs.lte.getTime();
+    expect(Math.abs(cutoff - (before - mockConfig.SEND_PAYJOIN_CUTOFF * 1000))).toBeLessThan(2000);
   });
 
   it('releases exactly the recorded outpoints for a stuck send, then clears lockedInputs', async () => {
@@ -509,6 +537,20 @@ describe('processTerminalSend — fallback broadcast before releasing locks', ()
     });
     // the inputs are spent by the broadcast — no unlock needed
     expect(cnClient.lockUnspent).not.toHaveBeenCalled();
+  });
+
+  it('broadcasts the original for a cutoff-reached send whose bip21 expiry is still a day away', async () => {
+    mockSweep([expiredRow({ expiryTs: new Date(Date.now() + 24 * 3600 * 1000) })]);
+    cnClient.getTransaction.mockResolvedValue(NOT_FOUND);
+    cnClient.sendRawTransaction.mockResolvedValue({ result: FALLBACK_TXID, error: null });
+
+    await restoreSendSessions(mockConfig as Config);
+
+    expect(cnClient.sendRawTransaction).toHaveBeenCalledWith({ hex: FALLBACK_HEX, wallet: mockConfig.SEND_WALLET });
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: 42 },
+      data: { txid: FALLBACK_TXID, fallbackTs: expect.any(Date), lockedInputs: Prisma.DbNull },
+    });
   });
 
   it('does not broadcast when the tx is already on the network — records it and leaves the locks to the spend', async () => {

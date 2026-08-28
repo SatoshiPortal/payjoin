@@ -50,9 +50,10 @@ jest.mock('./persister', () => ({
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
-import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal, createSender } from './payjoin';
+import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal, createSender, sendPayjoinDeadline } from './payjoin';
 import { ReceiveStatus, SendStatus } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
+import { config } from '../config';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { cnClient } = require('./globals');
@@ -280,6 +281,32 @@ describe('appendReceiveStatus', () => {
 });
 
 // ---------------------------------------------------------------------------
+// sendPayjoinDeadline
+// ---------------------------------------------------------------------------
+
+describe('sendPayjoinDeadline', () => {
+
+  it('uses the cutoff when the bip21 expiry is further out', () => {
+    const createdTs = new Date();
+    const expiryTs = new Date(createdTs.getTime() + 24 * 3600 * 1000);
+    expect(sendPayjoinDeadline({ createdTs, expiryTs }).getTime())
+      .toBe(createdTs.getTime() + config.SEND_PAYJOIN_CUTOFF * 1000);
+  });
+
+  it('uses the bip21 expiry when it lands before the cutoff', () => {
+    const createdTs = new Date();
+    const expiryTs = new Date(createdTs.getTime() + 60_000);
+    expect(sendPayjoinDeadline({ createdTs, expiryTs })).toBe(expiryTs);
+  });
+
+  it('falls back to the cutoff when expiryTs is null', () => {
+    const createdTs = new Date();
+    expect(sendPayjoinDeadline({ createdTs, expiryTs: null }).getTime())
+      .toBe(createdTs.getTime() + config.SEND_PAYJOIN_CUTOFF * 1000);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // appendSendStatus
 // ---------------------------------------------------------------------------
 
@@ -309,6 +336,18 @@ describe('appendSendStatus', () => {
 
   it('returns Pending when nothing is set', () => {
     expect(appendSendStatus(makeSend()).status).toBe(SendStatus.Pending);
+  });
+
+  it('returns Expired past SEND_PAYJOIN_CUTOFF even when expiryTs is far in the future', () => {
+    const createdTs = new Date(Date.now() - (config.SEND_PAYJOIN_CUTOFF + 60) * 1000);
+    const expiryTs = new Date(Date.now() + 24 * 3600 * 1000);
+    expect(appendSendStatus(makeSend({ createdTs, expiryTs })).status).toBe(SendStatus.Expired);
+  });
+
+  it('Fallback takes priority over the cutoff', () => {
+    const createdTs = new Date(Date.now() - (config.SEND_PAYJOIN_CUTOFF + 60) * 1000);
+    const result = appendSendStatus(makeSend({ createdTs, fallbackTs: new Date() }));
+    expect(result.status).toBe(SendStatus.Fallback);
   });
 
   it('Cancelled takes priority over Confirmed', () => {

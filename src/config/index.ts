@@ -21,6 +21,7 @@ export interface Config {
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
   MAX_PAYJOIN_FEE_RATE: number; // sat/vbyte — reject payjoin proposals whose fee rate exceeds this ceiling
   RESERVATION_RELEASE_GRACE: number; // seconds past expiryTs before an unbroadcast send lock is force-released
+  SEND_PAYJOIN_CUTOFF: number; // seconds from send creation before we give up on payjoin and broadcast the original
 }
 
 const sendWallet = process.env.SEND_WALLET || "01";
@@ -70,6 +71,7 @@ export let config: Config = {
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
   MAX_PAYJOIN_FEE_RATE: Number(process.env.MAX_PAYJOIN_FEE_RATE || 500), // 500 sat/vbyte default
   RESERVATION_RELEASE_GRACE: Number(process.env.RESERVATION_RELEASE_GRACE || 1800), // 30m default for unbroadcast send locks; posted receive reservations require a confirmed outcome
+  SEND_PAYJOIN_CUTOFF: Number(process.env.SEND_PAYJOIN_CUTOFF || 900), // 15m; caps the receiver's BIP21 expiry, which is often 24h+
 };
 
 export function reloadConfig(): Config {

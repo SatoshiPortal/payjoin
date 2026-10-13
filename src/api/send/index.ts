@@ -12,8 +12,25 @@ import { randomBytes } from "crypto";
 
 export function registerSendApi(): void {
   addJsonRpcMethod('send', send);
+  addJsonRpcMethod('validateBip21', validateBip21);
   addJsonRpcMethod('cancelSend', cancelSend);
   addJsonRpcMethod('getSend', getSend);
+}
+
+export function validateBip21(params: { bip21: string }): { isvalid: boolean, bip21: string, reason?: string } {
+  const bip21 = params?.bip21;
+
+  try {
+    const { expiry } = parseBip21(bip21);
+
+    if (expiry && expiry < new Date()) {
+      return { isvalid: false, bip21, reason: 'bip21 has already expired' };
+    }
+
+    return { isvalid: true, bip21 };
+  } catch {
+    return { isvalid: false, bip21, reason: 'Invalid bip21' };
+  }
 }
 
 export async function send(params: IReqSend): Promise<IRespSend> {

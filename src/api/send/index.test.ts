@@ -1,4 +1,6 @@
-import { send } from './index';
+import { send, validateBip21 } from './index';
+import { parseBip21, createSender } from '../../lib/payjoin';
+import { isValidAddress } from '../../lib/validate';
 
 jest.mock('payjoin', () => ({ payjoin: {} }));
 jest.mock('..', () => ({ addJsonRpcMethod: jest.fn() }));
@@ -68,5 +70,37 @@ describe('send callback token', () => {
       unconfirmedCallbackURL: expectedUrl,
       confirmedCallbackURL: expectedUrl,
     });
+  });
+});
+
+describe('validateBip21', () => {
+  const bip21 = 'bitcoin:bc1qsendaddress?pj=https://example.com';
+
+  beforeEach(() => jest.clearAllMocks());
+
+  afterEach(() => {
+    expect(db.send.create).not.toHaveBeenCalled();
+    expect(createSender).not.toHaveBeenCalled();
+    expect(cnClient.watch).not.toHaveBeenCalled();
+    expect(isValidAddress).not.toHaveBeenCalled();
+  });
+
+  it('accepts a parsed URI without requiring an amount', () => {
+    jest.mocked(parseBip21).mockReturnValueOnce({
+      ...parseBip21(bip21), amount: 0n,
+    });
+    expect(validateBip21({ bip21 })).toEqual({ isvalid: true, bip21 });
+  });
+
+  it('returns an invalid result for SDK parsing failures', () => {
+    jest.mocked(parseBip21).mockImplementationOnce(() => { throw new Error('bad endpoint'); });
+    expect(validateBip21({ bip21 })).toEqual({ isvalid: false, bip21, reason: 'Invalid bip21' });
+  });
+
+  it('rejects expiry in both validation and send before side effects', async () => {
+    const expired = { ...parseBip21(bip21), expiry: new Date(0) };
+    jest.mocked(parseBip21).mockReturnValueOnce(expired).mockReturnValueOnce(expired);
+    expect(validateBip21({ bip21 })).toEqual({ isvalid: false, bip21, reason: 'bip21 has already expired' });
+    await expect(send({ bip21 })).rejects.toMatchObject({ code: -32602, message: 'bip21 has already expired' });
   });
 });

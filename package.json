@@ -60,7 +60,7 @@
   "dependencies": {
     "@dinero.js/calculator-bigint": "2.0.0-alpha.14",
     "@prisma/client": "6.5.0",
-    "axios": "1.16.0",
+    "axios": "1.20.0",
     "dinero.js": "2.0.0-alpha.14",
     "dotenv": "16.4.7",
     "express": "4.22.1",

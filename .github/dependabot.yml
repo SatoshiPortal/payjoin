@@ -1,5 +1,5 @@
 # Scheduled version updates; security alerts and updates are enabled separately in GitHub.
-# Coupled npm packages stay together, including major upgrades. Other majors get separate PRs.
+# Routine updates allow minor and patch releases only; coupled npm packages stay together.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -12,6 +12,9 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       prisma:
         patterns:
@@ -33,6 +36,9 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         patterns:
@@ -50,6 +56,9 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         patterns:

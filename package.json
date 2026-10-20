@@ -2,6 +2,9 @@
   "name": "payjoin",
   "version": "1.0.0",
   "type": "commonjs",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "description": "",
   "main": "index.js",
   "prisma": {
@@ -24,7 +27,6 @@
   "devDependencies": {
     "@eslint/js": "9.39.4",
     "@types/axios": "0.14.4",
-    "@types/dinero.js": "1.9.4",
     "@types/express": "5.0.1",
     "@types/jest": "29.5.14",
     "@types/node": "22.13.13",
@@ -58,10 +60,9 @@
     }
   },
   "dependencies": {
-    "@dinero.js/calculator-bigint": "2.0.0-alpha.14",
     "@prisma/client": "6.5.0",
     "axios": "1.20.0",
-    "dinero.js": "2.0.0-alpha.14",
+    "dinero.js": "2.0.2",
     "dotenv": "16.4.7",
     "express": "4.22.1",
     "https-proxy-agent": "7.0.6",

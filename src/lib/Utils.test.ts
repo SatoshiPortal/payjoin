@@ -1,5 +1,26 @@
 import Utils from './Utils';
 
+describe('Utils.satsToBtc — exact bigint formatting', () => {
+  const cases: Array<[bigint, string]> = [
+    [0n, '0.00000000'],
+    [1n, '0.00000001'],
+    [-1n, '-0.00000001'],
+    [99n, '0.00000099'],
+    [-99n, '-0.00000099'],
+    [29_000_000n, '0.29000000'],
+    [100_000_000n, '1.00000000'],
+    [-150_000_000n, '-1.50000000'],
+    [2_100_000_000_000_000n, '21000000.00000000'],
+    [9_007_199_254_740_993n, '90071992.54740993'],
+    [-9_007_199_254_740_993n, '-90071992.54740993'],
+  ];
+
+  test.each(cases)('formats %s satoshis as %s BTC and round-trips exactly', (sats, btc) => {
+    expect(Utils.satsToBtc(sats)).toBe(btc);
+    expect(Utils.btcToSats(btc)).toBe(sats);
+  });
+});
+
 describe('Utils.btcToSats — float rounding', () => {
 
   /**

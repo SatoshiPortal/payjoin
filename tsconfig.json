@@ -1,10 +1,11 @@
 {
   "compilerOptions": {
-    "module": "commonjs",
+    "module": "NodeNext",
     "esModuleInterop": true,
+    "isolatedModules": true,
     "target": "ES2022",
     "noImplicitAny": false,
-    "moduleResolution": "node",
+    "moduleResolution": "NodeNext",
     "baseUrl": ".",
     "ignoreDeprecations": "5.0",
     "paths": {

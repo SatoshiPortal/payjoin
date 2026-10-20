@@ -4,6 +4,15 @@ module.exports = {
   setupFiles: ['<rootDir>/jest.setup.js'],
   testEnvironment: "node",
   transform: {
-    "^.+.tsx?$": ["ts-jest",{}],
+    "^.+\\.[tj]sx?$": ["ts-jest", {
+      tsconfig: {
+        module: "CommonJS",
+        moduleResolution: "node",
+        allowJs: true,
+        isolatedModules: true,
+      },
+    }],
   },
+  // Dinero 2 ships ESM; transform it for the existing CommonJS Jest runtime.
+  transformIgnorePatterns: ["/node_modules/(?!dinero\\.js/)"],
 };

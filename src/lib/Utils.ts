@@ -1,12 +1,8 @@
-import axios, { AxiosError, AxiosHeaders, AxiosRequestConfig } from "axios";
+import axios, { AxiosError, AxiosRequestConfig } from "axios";
 import logger from "./Log2File";
-import { calculator } from "@dinero.js/calculator-bigint";
-import {
-  createDinero,
-  toDecimal,
-} from "dinero.js";
+import { dinero as dineroBigInt, toDecimal } from "dinero.js/bigint";
 
-export const dineroBigInt = createDinero({ calculator });
+export { dineroBigInt };
 
 class Utils {
   static omit<T extends object, K extends keyof T>(obj: T, keysToOmit: K[]): Omit<T, K> {
@@ -33,7 +29,7 @@ class Utils {
     );
   }
 
-  static async post(url: string, data: any, headers?: AxiosHeaders): Promise<any> {
+  static async post(url: string, data: any, headers?: AxiosRequestConfig["headers"]): Promise<any> {
     // use axios to send a POST request to url with the data
 
     logger.info("Utils.post:", url, data);

@@ -14,6 +14,7 @@ jest.mock('payjoin', () => ({
 jest.mock('../../lib/globals', () => ({
   cnClient: {
     getTransaction: jest.fn(),
+    decodeRawTransaction: jest.fn(),
     listUnspent: jest.fn(),
     unwatch: jest.fn(),
   },
@@ -113,6 +114,7 @@ function webhookData(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  cnClient.decodeRawTransaction.mockResolvedValue({});
   jest.spyOn(Utils, 'post').mockResolvedValue(true);
   cnClient.getTransaction.mockImplementation(async (txid: string) => ({
     result: {
@@ -562,5 +564,60 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
       data: expect.objectContaining({ txid: REAL_TXID, confirmedTs: expect.any(Date) }),
     });
     expect(cnClient.unwatch).toHaveBeenCalled();
+  });
+});
+
+
+describe('handleAddressCallback — sender fallback fee', () => {
+  it.each([false, true])('reports the entire fee when fallback was already recorded: %s', async (alreadyRecorded) => {
+    const fallbackTs = alreadyRecorded ? new Date() : null;
+    const row = {
+      ...makeReceiveRow({
+        txid: alreadyRecorded ? REAL_TXID : null,
+        fallbackTs,
+        fallbackTxHex: 'deadbeef',
+      }),
+      senderFee: null,
+    };
+    db.send.findFirst.mockResolvedValue(row);
+    db.send.update.mockImplementation(async ({ data }: any) => ({ ...row, ...data }));
+    cnClient.decodeRawTransaction.mockResolvedValue({ result: { tx: { txid: REAL_TXID } } });
+
+    await handleAddressCallback(webhookData({ fees: 0.00000987 }), 'send', CALLBACK_TOKEN);
+
+    expect(db.send.update).toHaveBeenCalledWith({
+      where: { id: row.id },
+      data: expect.objectContaining({
+        fee: 987n,
+        senderFee: 987n,
+        fallbackTs: fallbackTs ?? expect.any(Date),
+      }),
+    });
+    expect(Utils.post).toHaveBeenCalledWith(CALLBACK_URL, expect.objectContaining({
+      senderFee: '987',
+      status: 'fallback',
+    }));
+  });
+
+  it.each([false, true])('preserves the negotiated fee when fallback decoding fails: %s', async (decodeFails) => {
+    const row = {
+      ...makeReceiveRow({ txid: REAL_TXID, fallbackTxHex: 'deadbeef' }),
+      senderFee: 800n,
+    };
+    db.send.findFirst.mockResolvedValue(row);
+    db.send.update.mockImplementation(async ({ data }: any) => ({ ...row, ...data }));
+    cnClient.decodeRawTransaction.mockResolvedValue(decodeFails
+      ? { error: { message: 'decode failed' } }
+      : { result: { tx: { txid: GUESSED_TXID } } });
+
+    await handleAddressCallback(webhookData({ fees: 0.00000987 }), 'send', CALLBACK_TOKEN);
+
+    const update = db.send.update.mock.calls[0][0].data;
+    expect(update).not.toHaveProperty('senderFee');
+    expect(update).not.toHaveProperty('fallbackTs');
+    expect(Utils.post).toHaveBeenCalledWith(CALLBACK_URL, expect.objectContaining({
+      senderFee: '800',
+      status: 'unconfirmed',
+    }));
   });
 });

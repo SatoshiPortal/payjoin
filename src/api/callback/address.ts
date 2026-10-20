@@ -203,6 +203,21 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
         txid: data.txid,
         fee: Utils.btcToSats(data.fees), // this fee will be the total - but we'll want the split as well
       }
+      if (type === "send") {
+        let isFallback = !!payjoin.fallbackTs && payjoin.txid === data.txid;
+        if (!isFallback && payjoin.fallbackTxHex) {
+          const { error, result } = await cnClient.decodeRawTransaction({ hex: payjoin.fallbackTxHex });
+          isFallback = !error && result?.tx?.txid === data.txid;
+        }
+
+        // The sender pays the entire fee of the original transaction, even if
+        // the receiver broadcasts it before our fallback sweep runs.
+        if (isFallback) {
+          updateData.senderFee = updateData.fee;
+          updateData.fallbackTs = payjoin.fallbackTs ?? new Date();
+        }
+      }
+
       if (type === "receive") {
         updateData.firstSeenTs = payjoin.firstSeenTs ?? new Date();
       }

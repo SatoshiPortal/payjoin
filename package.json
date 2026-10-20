@@ -64,7 +64,7 @@
     "dinero.js": "2.0.0-alpha.14",
     "dotenv": "16.4.7",
     "express": "4.22.1",
-    "https-proxy-agent": "7.0.6",
+    "https-proxy-agent": "9.1.0",
     "json-rpc-2.0": "1.7.0",
     "payjoin": "file:vendor/payjoin-1.0.0.tgz",
     "pg": "8.20.0",

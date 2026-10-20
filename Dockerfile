@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS build-base
+FROM node:25-bookworm-slim AS build-base
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     jq \
@@ -17,7 +17,7 @@ RUN npm ci
 #--------------------------------------------------------------
 
 # Development image
-FROM node:22-bookworm-slim AS dev
+FROM node:25-bookworm-slim AS dev
 
 WORKDIR /payjoin
 
@@ -46,7 +46,7 @@ CMD ["npm", "run", "start:dev"]
 #--------------------------------------------------------------
 
 # Production image
-FROM node:22-bookworm-slim AS prod
+FROM node:25-bookworm-slim AS prod
 
 WORKDIR /payjoin
 

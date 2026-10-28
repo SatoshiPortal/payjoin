@@ -5,7 +5,7 @@ import { Config } from "../config";
 import { Prisma, Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse, randomRelay, withRelayFallback } from "../lib/payjoin";
+import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse, fetchSessionResponse, withRelayFallback } from "../lib/payjoin";
 import { SenderPersister } from "../lib/persister";
 import { FallbackOutcome } from "../types/payjoin";
 import { AxiosError } from "axios";
@@ -60,7 +60,7 @@ export async function processSendSession(sendSess: Send, config: Config) {
         logger.debug(processSendSession, 'Sender is in WithReplyKey state — sending initial V2 post');
 
         const sender = sessionState.inner.inner;
-        const { result: { responseBuffer, ohttpCtx }, relay } = await withRelayFallback(async (relay) => {
+        const { result: { responseBuffer, ohttpCtx }, relay } = await withRelayFallback(payjoin.Uri.parse(sendSess.bip21).checkPjSupported().pjEndpoint(), async (relay) => {
           const { request, ohttpCtx } = sender.createV2PostRequest(relay);
           const responseBuffer = await fetchBufferResponse(request);
           return { responseBuffer, ohttpCtx };
@@ -77,10 +77,10 @@ export async function processSendSession(sendSess: Send, config: Config) {
         logger.debug(processSendSession, 'Sender is in PollingForProposal state — polling for proposal');
 
         const sender = sessionState.inner.inner;
-        const { request, ohttpCtx } = sender.createPollRequest(sendSess.ohttpRelay ?? randomRelay());
+        let rr: ReturnType<typeof sender.createPollRequest>;
         let responseBuffer: ArrayBuffer;
         try {
-          responseBuffer = await fetchBufferResponse(request, config.OHTTP_LONGPOLL_TIMEOUT_MS);
+          ({ rr, responseBuffer } = await fetchSessionResponse(sendSess.bip21, sender.createPollRequest.bind(sender), true));
         } catch (e) {
           // The directory long-polls (~30s) waiting for a payjoin proposal.
           // Our client timeout fires first (ECONNABORTED). Treat as Stasis.
@@ -90,7 +90,7 @@ export async function processSendSession(sendSess: Send, config: Config) {
           }
           throw e;
         }
-        const outcome = sender.processResponse(responseBuffer, ohttpCtx).save(persister);
+        const outcome = sender.processResponse(responseBuffer, rr.ohttpCtx).save(persister);
 
         if (payjoin.PollingForProposalTransitionOutcome.Stasis.instanceOf(outcome)) {
           logger.info(processSendSession, 'No proposal received yet — will try again next poll');

@@ -8,52 +8,44 @@ import { IRespSend } from "../types/api/send";
 import { cnClient } from "./globals";
 import IRespDecodePsbt from "../types/cyphernode/IRespDecodePsbt";
 
-import axios, { AxiosResponse } from 'axios';
+import axios, { AxiosError, AxiosResponse } from 'axios';
+import { randomInt } from 'crypto';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import logger from "./Log2File";
 import { decodeBech32NoChecksum, decodeU32LE } from "./bech32";
 import { ReceiverPersister, SenderPersister } from "./persister";
 import { db } from "./db";
 
-const recentRelayFailures = new Map<string, number>();
-const RELAY_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
-
-export function recordRelayFailure(relay: string): void {
-  recentRelayFailures.set(relay, Date.now());
-}
-
-function relayIsAvailable(relay: string): boolean {
-  const lastFailure = recentRelayFailures.get(relay);
-  if (!lastFailure) return true;
-  return Date.now() - lastFailure > RELAY_FAILURE_COOLDOWN_MS;
-}
-
 /** Fisher-Yates shuffle (returns a new array) — randomizes initial relay choice to avoid a deterministic fingerprint. */
 function shuffled<T>(arr: readonly T[]): T[] {
   const out = [...arr];
   for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomInt(i + 1);
     [out[i], out[j]] = [out[j], out[i]];
   }
   return out;
 }
 
-/** Pick a random relay — used as a fallback when a session has no pinned relay yet. */
-export function randomRelay(): string {
-  return config.OHTTP_RELAYS[Math.floor(Math.random() * config.OHTTP_RELAYS.length)];
+// Group subdomains by operator, conservatively grouping multi-label public suffixes.
+function serverDomain(url: string): string {
+  const host = new URL(url).hostname.toLowerCase().replace(/\.$/, '');
+  if (!host || host.includes('%') || host.split('.').some(label => !label)) {
+    throw new Error('Unreadable payjoin server host');
+  }
+  return host.includes(':') || /^[\d.]+$/.test(host) ? host : host.split('.').slice(-2).join('.');
 }
 
-export async function withRelayFallback<T>(fn: (relay: string) => Promise<T>): Promise<{ result: T; relay: string }> {
-  // Randomize order, then float recently-failed relays to the back (stable sort preserves the shuffle within each bucket).
-  const sortedRelays = shuffled(config.OHTTP_RELAYS).sort((a, b) => {
-    return (relayIsAvailable(a) ? 0 : 1) - (relayIsAvailable(b) ? 0 : 1);
-  });
+export async function withRelayFallback<T>(directory: string, fn: (relay: string) => Promise<T>, longPoll = false): Promise<{ result: T; relay: string }> {
+  const domain = serverDomain(directory);
+  const relays = shuffled(config.PAYJOIN_SERVERS.filter(relay => serverDomain(relay) !== domain));
+  if (!relays.length) throw new Error('No OHTTP relay outside the directory domain');
   let lastError: unknown;
-  for (const relay of sortedRelays) {
+  for (const relay of relays) {
     try {
       const result = await fn(relay);
       return { result, relay };
     } catch (e) {
+      if (longPoll && e instanceof AxiosError && e.code === 'ECONNABORTED') throw e;
       logger.warn(withRelayFallback, `Relay ${relay} failed, trying next:`, e);
       lastError = e;
     }
@@ -63,13 +55,17 @@ export async function withRelayFallback<T>(fn: (relay: string) => Promise<T>): P
 
 async function fetchOhttpKeys(
   ohttpRelay: string,
-  payjoinDirectory: string
+  payjoinDirectory: string,
+  timeoutMs: number
 ): Promise<Uint8Array> {
   const ohttpKeysUrl = new URL(payjoinDirectory).origin + '/.well-known/ohttp-gateway';
   const proxyAgent = new HttpsProxyAgent(ohttpRelay);
   const response: AxiosResponse = await axios.get(ohttpKeysUrl, {
     httpsAgent: proxyAgent,
-    timeout: config.OHTTP_RELAY_TIMEOUT_MS,
+    timeout: timeoutMs,
+    signal: AbortSignal.timeout(timeoutMs),
+    maxRedirects: 0,
+    proxy: false,
     headers: {
       Accept: 'application/ohttp-keys'
     },
@@ -82,18 +78,44 @@ async function fetchOhttpKeys(
 }
 
 export async function getOhttpKeys() {
-  logger.debug(getOhttpKeys, 'Fetching OHTTP keys from relays:', config.OHTTP_RELAYS, 'and directory:', config.PAYJOIN_DIRECTORY);
-  const { result: ohttpKeysBuffer, relay } = await withRelayFallback((relay) =>
-    fetchOhttpKeys(relay, config.PAYJOIN_DIRECTORY)
-  );
-  logger.debug(getOhttpKeys, 'Fetched OHTTP keys successfully via relay:', relay);
-  return { keys: payjoin.OhttpKeys.decode(ohttpKeysBuffer.buffer as ArrayBuffer), relay };
+  const deadline = Date.now() + 30000;
+  let lastError: unknown;
+  for (const directory of shuffled(config.PAYJOIN_SERVERS)) {
+    try {
+      const { result: keys, relay } = await withRelayFallback(directory, async (relay) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('Payjoin directory discovery timed out');
+        const buffer = await fetchOhttpKeys(relay, directory, Math.min(config.OHTTP_RELAY_TIMEOUT_MS, remaining));
+        return payjoin.OhttpKeys.decode(buffer.buffer as ArrayBuffer);
+      });
+      return { keys, relay, directory };
+    } catch (e) {
+      lastError = e;
+      if (Date.now() >= deadline) break;
+    }
+  }
+  throw lastError ?? new Error('No payjoin directories configured');
+}
+
+/** Keep each response paired with the OHTTP context of the successful attempt. */
+export async function fetchSessionResponse<T extends { request: { url: string; contentType: string; body: any } }>(
+  bip21: string, createRequest: (relay: string) => T, longPoll = false
+): Promise<{ rr: T; responseBuffer: ArrayBuffer }> {
+  const directory = payjoin.Uri.parse(bip21).checkPjSupported().pjEndpoint();
+  const { result } = await withRelayFallback(directory, async (relay) => {
+    const rr = createRequest(relay);
+    const responseBuffer = await fetchBufferResponse(rr.request, longPoll ? config.OHTTP_LONGPOLL_TIMEOUT_MS : config.OHTTP_RELAY_TIMEOUT_MS);
+    return { rr, responseBuffer };
+  }, longPoll);
+  return result;
 }
 
 export async function fetchBufferResponse(request: { url: string, contentType: string, body: any }, timeoutMs: number = config.OHTTP_RELAY_TIMEOUT_MS): Promise<ArrayBuffer> {
     const axiosResponse = await axios.post(request.url, request.body, {
         headers: { "Content-Type": request.contentType },
         responseType: 'arraybuffer',
+        maxRedirects: 0,
+        proxy: false,
         timeout: timeoutMs,
     });
     return axiosResponse.data;
@@ -259,11 +281,11 @@ export function sessionHasPostedProposal(sessionJson: string | null | undefined)
 export async function createReceiver({ id, address, amount }: { id: number | string, address: string, amount: bigint }): Promise<{ bip21: string; ohttpRelay: string }> {
   logger.info(createReceiver, `Creating receiver for address: ${address} amount: ${amount}`);
 
-  const { keys: ohttpKeys, relay: ohttpRelay } = await getOhttpKeys();
+  const { keys: ohttpKeys, relay: ohttpRelay, directory } = await getOhttpKeys();
 
   const persister = new ReceiverPersister({ id, db });
 
-  const receiver = new payjoin.ReceiverBuilder(address, config.PAYJOIN_DIRECTORY, ohttpKeys)
+  const receiver = new payjoin.ReceiverBuilder(address, directory, ohttpKeys)
     .withAmount(amount)
     .withExpiration(config.PAYJOIN_RECEIVE_EXPIRY)
     .build()

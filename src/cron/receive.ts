@@ -6,7 +6,7 @@ import { Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, hexToArrayBuffer, randomRelay, recordRelayFailure, sessionHasPostedProposal } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchSessionResponse, hexToArrayBuffer, sessionHasPostedProposal } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 import { claimSeenInputsForSession, outpointKey, SeenInputConflictError, SeenOutpoint } from "../lib/seenInputs";
@@ -171,10 +171,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.HasReplyableError) {
         logger.info(processReceiveSession, 'Receiver is in HasReplyableError state — returning error response to sender');
 
-        const errReq = receiver.createErrorRequest(receiveSess.ohttpRelay ?? randomRelay());
+        let errReq: ReturnType<typeof receiver.createErrorRequest>;
         let errResponseBuffer: ArrayBuffer;
         try {
-          errResponseBuffer = await fetchBufferResponse(errReq.request);
+          ({ rr: errReq, responseBuffer: errResponseBuffer } = await fetchSessionResponse(receiveSess.bip21!, receiver.createErrorRequest.bind(receiver)));
         } catch (e) {
           // Same long-poll/timeout semantics as the proposal poll: a transient relay
           // timeout isn't a hard failure — retry on the next cron cycle.
@@ -206,10 +206,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.Initialized) {
         logger.debug(processReceiveSession, 'Receiver is in Initialized state');
 
-        const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? randomRelay());
+        let rr: ReturnType<typeof receiver.createPollRequest>;
         let responseBuffer: ArrayBuffer;
         try {
-          responseBuffer = await fetchBufferResponse(rr.request, config.OHTTP_LONGPOLL_TIMEOUT_MS);
+          ({ rr, responseBuffer } = await fetchSessionResponse(receiveSess.bip21!, receiver.createPollRequest.bind(receiver), true));
         } catch (e) {
           // The directory uses a long-poll (~30s) waiting for a sender's proposal.
           // Our client timeout fires first, producing ECONNABORTED. This is not a
@@ -583,8 +583,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         // flush persisted state before sending the proposal so a crash after send can replay correctly
         await persister.flush();
 
-        const rr = receiver.createPostRequest(receiveSess.ohttpRelay ?? randomRelay());
-        const responseBuffer = await fetchBufferResponse(rr.request);
+        const { rr, responseBuffer } = await fetchSessionResponse(receiveSess.bip21!, receiver.createPostRequest.bind(receiver));
 
         // Note: a success response here doesn't mean the sender accepted the PSBT.
         // Fallback tx broadcast is handled separately after a timeout if the payjoin tx is not seen.
@@ -613,10 +612,6 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
     } catch (e) {
       logger.error(processReceiveSession, 'failed to restore session:', describePayjoinError(e));
-
-      if (e instanceof AxiosError && e.code === 'ECONNABORTED' && receiveSess.ohttpRelay) {
-        recordRelayFailure(receiveSess.ohttpRelay);
-      }
 
       await db.receive.updateMany({
         where: { id: receiveSess.id, failedTs: null },

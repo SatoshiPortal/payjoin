@@ -2,7 +2,7 @@ import { payjoin } from "payjoin";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
 import { Config } from "../config";
-import { Receive } from "@prisma/client";
+import { Prisma, Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
@@ -1195,6 +1195,14 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
       txid: sendResult,
       fallbackTs: new Date(),
       amount: fallbackAmount,
+      senderInAmount: null,
+      senderOutAmount: null,
+      receiverInAmount: 0n,
+      receiverOutAmount: 0n,
+      txInputs: Prisma.DbNull,
+      txOutputs: Prisma.DbNull,
+      receiverFee: 0n,
+      fee: null, // The address callback supplies the actual fallback fee.
     }
   });
   logger.info(broadcastFallback, 'updated receive session with txid:', sendResult, updatedReceive.id);

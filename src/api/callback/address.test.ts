@@ -1,5 +1,5 @@
 import { handleAddressCallback } from './address';
-import { Receive } from '@prisma/client';
+import { Prisma, Receive } from '@prisma/client';
 import { config } from '../../config';
 import Utils from '../../lib/Utils';
 
@@ -345,6 +345,26 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     expect(Utils.post).toHaveBeenCalled();
   });
 
+  it.each(['fallbackTs', 'nonPayjoinTs'])('clears stale proposal details when the txid matches and %s is set', async (status) => {
+    const row = makeReceiveRow({
+      txid: REAL_TXID, [status]: new Date(), fee: 1500n, receiverFee: 475n,
+      senderInAmount: 2000000n, senderOutAmount: 1739012n,
+      receiverInAmount: 10000000n, receiverOutAmount: 10259525n,
+      txInputs: [{ txid: GUESSED_TXID }], txOutputs: [{ value: 10259525 }],
+    });
+    db.receive.findFirst.mockResolvedValue(row);
+    db.receive.update.mockResolvedValue(row);
+
+    await handleAddressCallback(webhookData({ fees: 0.00000987 }), 'receive', CALLBACK_TOKEN);
+
+    expect(db.receive.update.mock.calls[0][0].data).toEqual(expect.objectContaining({
+      fee: 987n, receiverFee: 0n,
+      senderInAmount: null, senderOutAmount: null,
+      receiverInAmount: 0n, receiverOutAmount: 0n,
+      txInputs: Prisma.DbNull, txOutputs: Prisma.DbNull,
+    }));
+  });
+
   it('takes the normal update path without checking listUnspent when the txid already matches', async () => {
     const row = makeReceiveRow({ txid: REAL_TXID, reservedInputTxid: RESERVED_TXID, reservedInputVout: RESERVED_VOUT });
     db.receive.findFirst.mockResolvedValue(row);
@@ -406,6 +426,11 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
         receiverFee: 0n,
         receiverInAmount: 0n,
         receiverOutAmount: 0n,
+        senderInAmount: null,
+        senderOutAmount: null,
+        txInputs: Prisma.DbNull,
+        txOutputs: Prisma.DbNull,
+        fee: 2381n,
         txid: REAL_TXID,
         nonPayjoinTs: expect.any(Date),
       },
@@ -450,6 +475,11 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
       receiverFee: 0n,
       receiverInAmount: 0n,
       receiverOutAmount: 0n,
+      senderInAmount: null,
+      senderOutAmount: null,
+      txInputs: Prisma.DbNull,
+      txOutputs: Prisma.DbNull,
+      fee: 2381n,
     });
     expect(data).not.toHaveProperty('nonPayjoinTs');
   });
@@ -590,6 +620,12 @@ describe('handleAddressCallback — sender fallback fee', () => {
       data: expect.objectContaining({
         fee: 987n,
         senderFee: 987n,
+        senderInAmount: null,
+        senderOutAmount: null,
+        receiverInAmount: 0n,
+        receiverOutAmount: 0n,
+        txInputs: Prisma.DbNull,
+        txOutputs: Prisma.DbNull,
         fallbackTs: fallbackTs ?? expect.any(Date),
       }),
     });

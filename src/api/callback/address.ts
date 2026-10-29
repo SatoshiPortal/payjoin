@@ -4,7 +4,7 @@ import logger from "../../lib/Log2File";
 import Utils from "../../lib/Utils";
 import { appendReceiveStatus, appendSendStatus } from "../../lib/payjoin";
 import { lock, cnClient } from "../../lib/globals";
-import { Receive, Send } from "@prisma/client";
+import { Prisma, Receive, Send } from "@prisma/client";
 
 export function addressCallbackUrl(type: "send" | "receive", address: string, token?: string | null) {
   const baseUrl = `${config.URL_SERVER}:${config.URL_PORT}/${type}/address/${address}`;
@@ -157,8 +157,13 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
             data: {
               amount: paidAmount, // record the amount verified from the transaction outputs
               receiverFee: 0n, // we contribute no fee in a fallback tx
+              senderInAmount: null,
+              senderOutAmount: null,
               receiverInAmount: 0n,
               receiverOutAmount: 0n,
+              txInputs: Prisma.DbNull,
+              txOutputs: Prisma.DbNull,
+              fee: Utils.btcToSats(data.fees),
             }
           });
         } else {
@@ -169,8 +174,13 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
             data: {
               amount: paidAmount,
               receiverFee: 0n, // we contribute no fee in a non-payjoin tx
+              senderInAmount: null,
+              senderOutAmount: null,
               receiverInAmount: 0n,
               receiverOutAmount: 0n,
+              txInputs: Prisma.DbNull,
+              txOutputs: Prisma.DbNull,
+              fee: Utils.btcToSats(data.fees),
               txid: data.txid,
               nonPayjoinTs: new Date(),
             }
@@ -213,12 +223,27 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
         // The sender pays the entire fee of the original transaction, even if
         // the receiver broadcasts it before our fallback sweep runs.
         if (isFallback) {
+          updateData.senderInAmount = null;
+          updateData.senderOutAmount = null;
+          updateData.receiverInAmount = 0n;
+          updateData.receiverOutAmount = 0n;
+          updateData.txInputs = Prisma.DbNull;
+          updateData.txOutputs = Prisma.DbNull;
           updateData.senderFee = updateData.fee;
           updateData.fallbackTs = payjoin.fallbackTs ?? new Date();
         }
       }
 
       if (type === "receive") {
+        if (payjoin.fallbackTs || (payjoin as Receive).nonPayjoinTs) {
+          updateData.senderInAmount = null;
+          updateData.senderOutAmount = null;
+          updateData.receiverInAmount = 0n;
+          updateData.receiverOutAmount = 0n;
+          updateData.txInputs = Prisma.DbNull;
+          updateData.txOutputs = Prisma.DbNull;
+          updateData.receiverFee = 0n;
+        }
         updateData.firstSeenTs = payjoin.firstSeenTs ?? new Date();
       }
       if (confirmations >= 1 && payjoin.confirmedTs === null) {

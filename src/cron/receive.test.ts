@@ -1,7 +1,7 @@
 import { broadcastFallback, sumReceiverInputs, checkNoInputsSeen, reserveCommittedInput, releaseReservedInput, availableInputs } from './receive';
 import { SeenInputConflictError } from '../lib/seenInputs';
 import { ReceiverPersister } from '../lib/persister';
-import { Receive } from '@prisma/client';
+import { Prisma, Receive } from '@prisma/client';
 import { Config } from '../config';
 
 // ---------------------------------------------------------------------------
@@ -340,6 +340,24 @@ describe('broadcastFallback — output substitution address bug', () => {
     const updateArgs = db.receive.update.mock.calls[0][0];
     expect(updateArgs.data.amount).toBe(FALLBACK_AMOUNT_SATS); // 100 000 sats ✓
     expect(updateArgs.data.txid).toBe(FALLBACK_TXID);
+  });
+
+  it('clears proposal accounting when broadcasting a receive fallback', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+    await broadcastFallback(makeReceiveSess({
+      fee: 1500n, receiverFee: 475n,
+      senderInAmount: 2000000n, senderOutAmount: 1739012n,
+      receiverInAmount: 10000000n, receiverOutAmount: 10259525n,
+      txInputs: [{ txid: 'proposal' }], txOutputs: [{ value: 10259525 }],
+    }), mockConfig as Config);
+
+    expect(db.receive.update.mock.calls[0][0].data).toEqual({
+      txid: FALLBACK_TXID, fallbackTs: expect.any(Date), amount: FALLBACK_AMOUNT_SATS,
+      fee: null, receiverFee: 0n,
+      senderInAmount: null, senderOutAmount: null,
+      receiverInAmount: 0n, receiverOutAmount: 0n,
+      txInputs: Prisma.DbNull, txOutputs: Prisma.DbNull,
+    });
   });
 
   it('returns early without broadcasting when fallbackTxHex is absent', async () => {

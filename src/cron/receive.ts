@@ -4,6 +4,7 @@ import logger from "../lib/Log2File";
 import { Config } from "../config";
 import { Prisma, Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
+import { LockManager } from "../lib/Locker";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
 import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchSessionResponse, hexToArrayBuffer, sessionHasPostedProposal } from "../lib/payjoin";
@@ -393,27 +394,33 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.WantsInputs) {
         logger.debug(processReceiveSession, 'Receiver is in WantsInputs state');
 
-        // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
-        const inputs = await availableInputs(config, receiveSess.amount);
-        logger.debug(processReceiveSession, 'selected inputs:', inputs);
+        // Serialize selection and reservation across sessions and replicas sharing this wallet.
+        const reserved = await LockManager.runDetached(() => lock.acquire(`receive-inputs:${config.RECEIVE_WALLET}`, async () => {
+          // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
+          const inputs = await availableInputs(config, receiveSess.amount);
+          logger.debug(processReceiveSession, 'selected inputs:', inputs);
 
-        if (inputs.length === 0) {
-          logger.error(processReceiveSession, 'no inputs found to contribute');
-          return;
-        }
+          if (inputs.length === 0) {
+            logger.error(processReceiveSession, 'no inputs found to contribute');
+            return null;
+          }
 
-        // The selected InputPair cannot be identified here: the FFI returns a
-        // freshly lifted wrapper object with no outpoint accessors. The
-        // committed outpoint is instead recovered from the CommittedInputs
-        // session event and reserved below, before any signing.
-        const inputPairs = inputs.map((input) => input.inputPair);
-        const selectedInput: payjoin.InputPairLike = receiver.tryPreservingPrivacy(inputPairs);
+          // The selected InputPair cannot be identified here: the FFI returns a
+          // freshly lifted wrapper object with no outpoint accessors. The
+          // committed outpoint is instead recovered from the CommittedInputs
+          // session event and reserved below, before any signing.
+          const inputPairs = inputs.map((input) => input.inputPair);
+          const selectedInput: payjoin.InputPairLike = receiver.tryPreservingPrivacy(inputPairs);
 
-        receiver = receiver.contributeInputs([selectedInput])
-          .commitInputs()
-          .save(persister);
+          receiver = receiver.contributeInputs([selectedInput])
+            .commitInputs()
+            .save(persister);
 
-        logger.debug('tryContributeInputs complete');
+          logger.debug('tryContributeInputs complete');
+          return reserveCommittedInput(receiveSess, persister.load(), config);
+        }));
+        if (!reserved) return;
+        receiveSess = reserved;
       }
 
       // Reserve the committed receiver input before signing (issue #8): record
@@ -422,7 +429,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       // replayed sessions already past WantsInputs, so a crash between commit
       // and lock is healed here. Failing to reserve must abort before
       // finalizeProposal — never sign with an unreserved input.
-      if (
+      else if (
         receiver instanceof payjoin.WantsFeeRange ||
         receiver instanceof payjoin.ProvisionalProposal ||
         receiver instanceof payjoin.PayjoinProposal

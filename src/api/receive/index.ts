@@ -146,24 +146,14 @@ async function cancelReceive(params: { id: number }): Promise<{ id: number }> {
 async function getReceive(params: { id: number }): Promise<{ id: number }> {
   logger.info(getReceive, params);
 
-  return new Promise((resolve, reject) => {
-    lock.acquire(params.id.toString(), async () => {
-      try {
-        const { id } = params;
-
-        const receive = await db.receive.findUnique({ where: { id } });
-
-        if (!receive) {
-          throw new JSONRPCErrorException('Receive session not found', JSONRPCErrorCode.InvalidParams);
-        }
-
-        return appendReceiveStatus(receive);
-      } catch (e) {
-        logger.error(getReceive, 'Failed to get receive:', e);
-        throw new JSONRPCErrorException('Failed to get receive', JSONRPCErrorCode.InternalError);
-      }
-    })
-    .then(resolve)
-    .catch(reject);
-  });
+  try {
+    const receive = await db.receive.findUnique({ where: { id: params.id } });
+    if (!receive) {
+      throw new JSONRPCErrorException('Receive session not found', JSONRPCErrorCode.InvalidParams);
+    }
+    return appendReceiveStatus(receive);
+  } catch (e) {
+    logger.error(getReceive, 'Failed to get receive:', e);
+    throw new JSONRPCErrorException('Failed to get receive', JSONRPCErrorCode.InternalError);
+  }
 }

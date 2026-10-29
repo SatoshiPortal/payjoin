@@ -37,6 +37,7 @@ class Utils {
     const configs: AxiosRequestConfig = {
       url: url,
       method: "post",
+      timeout: 60000,
       data,
     };
     if (headers) configs.headers = headers;

@@ -4,7 +4,7 @@ import logger from "../../lib/Log2File";
 import Utils from "../../lib/Utils";
 import { appendReceiveStatus, appendSendStatus } from "../../lib/payjoin";
 import { lock, cnClient } from "../../lib/globals";
-import { Receive, Send } from "@prisma/client";
+import { Prisma, Receive, Send } from "@prisma/client";
 
 export function addressCallbackUrl(type: "send" | "receive", address: string, token?: string | null) {
   const baseUrl = `${config.URL_SERVER}:${config.URL_PORT}/${type}/address/${address}`;
@@ -157,8 +157,15 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
             data: {
               amount: paidAmount, // record the amount verified from the transaction outputs
               receiverFee: 0n, // we contribute no fee in a fallback tx
+              senderInAmount: null,
+              senderOutAmount: null,
               receiverInAmount: 0n,
               receiverOutAmount: 0n,
+              txInputs: Prisma.DbNull,
+              txOutputs: Prisma.DbNull,
+              fee: Utils.btcToSats(data.fees),
+              calledBackTs: null,
+              firstSeenTs: payjoin.firstSeenTs ?? new Date(),
             }
           });
         } else {
@@ -169,10 +176,17 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
             data: {
               amount: paidAmount,
               receiverFee: 0n, // we contribute no fee in a non-payjoin tx
+              senderInAmount: null,
+              senderOutAmount: null,
               receiverInAmount: 0n,
               receiverOutAmount: 0n,
+              txInputs: Prisma.DbNull,
+              txOutputs: Prisma.DbNull,
+              fee: Utils.btcToSats(data.fees),
               txid: data.txid,
               nonPayjoinTs: new Date(),
+              calledBackTs: null,
+              firstSeenTs: payjoin.firstSeenTs ?? new Date(),
             }
           });
           logger.info(handleAddressCallback, "non-payjoin tx received for session");
@@ -183,7 +197,8 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
           const postData = Utils.sanitizeResponse(
             appendReceiveStatus(updatedPayjoin as Receive)
           )
-          if (await Utils.post(payjoin.callbackUrl, postData)) {
+          const response = await Utils.post(payjoin.callbackUrl, postData);
+          if (response.status >= 200 && response.status < 300) {
             logger.info(handleAddressCallback, "callback sent to:", payjoin.callbackUrl);
             await db.receive.update({
               where: { id: payjoin.id },
@@ -201,6 +216,7 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       // @todo do we need to store it in a separate field?
       const updateData: any = {
         txid: data.txid,
+        calledBackTs: null,
         fee: Utils.btcToSats(data.fees), // this fee will be the total - but we'll want the split as well
       }
       if (type === "send") {
@@ -213,12 +229,27 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
         // The sender pays the entire fee of the original transaction, even if
         // the receiver broadcasts it before our fallback sweep runs.
         if (isFallback) {
+          updateData.senderInAmount = null;
+          updateData.senderOutAmount = null;
+          updateData.receiverInAmount = 0n;
+          updateData.receiverOutAmount = 0n;
+          updateData.txInputs = Prisma.DbNull;
+          updateData.txOutputs = Prisma.DbNull;
           updateData.senderFee = updateData.fee;
           updateData.fallbackTs = payjoin.fallbackTs ?? new Date();
         }
       }
 
       if (type === "receive") {
+        if (payjoin.fallbackTs || (payjoin as Receive).nonPayjoinTs) {
+          updateData.senderInAmount = null;
+          updateData.senderOutAmount = null;
+          updateData.receiverInAmount = 0n;
+          updateData.receiverOutAmount = 0n;
+          updateData.txInputs = Prisma.DbNull;
+          updateData.txOutputs = Prisma.DbNull;
+          updateData.receiverFee = 0n;
+        }
         updateData.firstSeenTs = payjoin.firstSeenTs ?? new Date();
       }
       if (confirmations >= 1 && payjoin.confirmedTs === null) {
@@ -238,7 +269,8 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
             ? appendSendStatus(updatedPayjoin as Send)
             : appendReceiveStatus(updatedPayjoin as Receive)
         )
-        if (await Utils.post(updatedPayjoin.callbackUrl, postData)) {
+        const response = await Utils.post(updatedPayjoin.callbackUrl, postData);
+        if (response.status >= 200 && response.status < 300) {
           logger.info(handleAddressCallback, "callback sent to:", updatedPayjoin.callbackUrl);
           await prismaModel.update({
             where: { id: payjoin.id },
@@ -262,4 +294,32 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       logger.error(handleAddressCallback, "Failed to handle address callback:", e);
     }
   });
+}
+
+// Retry the latest payment state, including confirmed rows whose watch has ended.
+export async function retryAddressCallbacks() {
+  for (const type of ["send", "receive"] as const) {
+    const model: any = type === "send" ? db.send : db.receive;
+    const pending = await model.findMany({
+      where: {
+        txid: { not: null }, callbackUrl: { not: null }, calledBackTs: null,
+        // A receive proposal has a txid before the sender actually pays.
+        ...(type === "receive" ? { firstSeenTs: { not: null } } : {}),
+      },
+      select: { id: true, address: true },
+    });
+    for (const row of pending) {
+      await lock.acquire(row.address, async () => {
+        // Re-read under the same lock as incoming callbacks and other replicas.
+        const current = await model.findUnique({ where: { id: row.id } });
+        if (!current?.callbackUrl || !current.txid || current.calledBackTs) return;
+        const payload = Utils.sanitizeResponse(type === "send"
+          ? appendSendStatus(current) : appendReceiveStatus(current));
+        const response = await Utils.post(current.callbackUrl, payload);
+        if (response.status >= 200 && response.status < 300) {
+          await model.update({ where: { id: row.id }, data: { calledBackTs: new Date() } });
+        }
+      });
+    }
+  }
 }

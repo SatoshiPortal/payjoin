@@ -1,4 +1,5 @@
-import { send, validateBip21 } from './index';
+import { send, validateBip21, registerSendApi } from './index';
+import { addJsonRpcMethod } from '..';
 import { parseBip21, createSender } from '../../lib/payjoin';
 import { isValidAddress } from '../../lib/validate';
 
@@ -25,6 +26,7 @@ jest.mock('../../lib/payjoin', () => ({
 jest.mock('../../lib/db', () => ({
   db: {
     send: {
+      findUnique: jest.fn(),
       create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 1, ...data })),
     },
   },
@@ -53,6 +55,20 @@ jest.mock('../../lib/Log2File', () => ({
 const { db } = require('../../lib/db');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { cnClient } = require('../../lib/globals');
+
+it('allows callback read-back while the session lock is held', async () => {
+  const { lock } = require('../../lib/globals');
+  const implementation = lock.acquire.getMockImplementation();
+  lock.acquire.mockImplementation(() => { throw new Error('session lock held'); });
+  try {
+    registerSendApi();
+    const getSend = (addJsonRpcMethod as jest.Mock).mock.calls.find(([name]) => name === 'getSend')[1];
+    db.send.findUnique.mockResolvedValue({ id: 1035, confirmedTs: new Date() });
+    await expect(getSend({ id: 1035 })).resolves.toMatchObject({ id: 1035, confirmedTs: expect.any(Date) });
+  } finally {
+    lock.acquire.mockImplementation(implementation);
+  }
+});
 
 describe('send callback token', () => {
   beforeEach(() => jest.clearAllMocks());

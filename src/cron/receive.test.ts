@@ -1,8 +1,9 @@
-import { broadcastFallback, sumReceiverInputs, checkNoInputsSeen, reserveCommittedInput, releaseReservedInput, availableInputs } from './receive';
+import { restoreReceiveSessions, broadcastFallback, sumReceiverInputs, checkNoInputsSeen, reserveCommittedInput, releaseReservedInput, availableInputs } from './receive';
 import { SeenInputConflictError } from '../lib/seenInputs';
 import { ReceiverPersister } from '../lib/persister';
-import { Receive } from '@prisma/client';
+import { Prisma, Receive } from '@prisma/client';
 import { Config } from '../config';
+import Utils from '../lib/Utils';
 
 // ---------------------------------------------------------------------------
 // Module mocks
@@ -28,7 +29,9 @@ jest.mock('../lib/globals', () => ({
     getTransaction: jest.fn(),
   },
   syncCnClient: {},
-  lock: { acquire: jest.fn((_keys: unknown, fn: () => unknown) => fn()) },
+  lock: {
+    acquire: jest.fn((_keys: unknown, fn: () => unknown) => fn()),
+  },
 }));
 
 jest.mock('../lib/db', () => ({
@@ -340,6 +343,24 @@ describe('broadcastFallback — output substitution address bug', () => {
     const updateArgs = db.receive.update.mock.calls[0][0];
     expect(updateArgs.data.amount).toBe(FALLBACK_AMOUNT_SATS); // 100 000 sats ✓
     expect(updateArgs.data.txid).toBe(FALLBACK_TXID);
+  });
+
+  it('clears proposal accounting when broadcasting a receive fallback', async () => {
+    cnClient.decodeRawTransaction.mockResolvedValue(mockDecodedFallbackTx(ORIGINAL_ADDRESS));
+    await broadcastFallback(makeReceiveSess({
+      fee: 1500n, receiverFee: 475n,
+      senderInAmount: 2000000n, senderOutAmount: 1739012n,
+      receiverInAmount: 10000000n, receiverOutAmount: 10259525n,
+      txInputs: [{ txid: 'proposal' }], txOutputs: [{ value: 10259525 }],
+    }), mockConfig as Config);
+
+    expect(db.receive.update.mock.calls[0][0].data).toEqual({
+      txid: FALLBACK_TXID, fallbackTs: expect.any(Date), amount: FALLBACK_AMOUNT_SATS,
+      fee: null, receiverFee: 0n,
+      senderInAmount: null, senderOutAmount: null,
+      receiverInAmount: 0n, receiverOutAmount: 0n,
+      txInputs: Prisma.DbNull, txOutputs: Prisma.DbNull,
+    });
   });
 
   it('returns early without broadcasting when fallbackTxHex is absent', async () => {
@@ -1059,5 +1080,77 @@ describe('availableInputs — redeem/witness script pass-through and per-candida
     const inputs = await availableInputs(mockConfig as Config, 100_000n);
 
     expect(inputs.map((i: { txid: string }) => i.txid)).toEqual([TXID_A, TXID_C]);
+  });
+});
+
+
+describe('concurrent receiver input selection', () => {
+  it('reserves the first session’s coin before the next session selects', async () => {
+    const { lock } = require('../lib/globals');
+    const names = ['HasReplyableError', 'Initialized', 'UncheckedOriginalPayload',
+      'MaybeInputsOwned', 'MaybeInputsSeen', 'OutputsUnknown', 'WantsOutputs',
+      'WantsInputs', 'WantsFeeRange', 'ProvisionalProposal', 'PayjoinProposal'];
+    const previous = Object.fromEntries(names.map(name => [name, payjoin[name]]));
+    names.forEach(name => { payjoin[name] = class {}; });
+    const rows = [makeReceiveSess({ id: 1 }), makeReceiveSess({ id: 2, address: 'second' })];
+    const claims = new Map<number, string>();
+    let held = false;
+    let queue = Promise.resolve();
+    lock.acquire.mockImplementation((key: unknown, fn: () => Promise<unknown>) => {
+      if (key !== 'receive-inputs:01') return fn();
+      const pending = queue.then(async () => {
+        held = true;
+        try { return await fn(); } finally { held = false; }
+      });
+      queue = pending.then(() => undefined);
+      return pending;
+    });
+    const replica = jest.spyOn(Utils, 'replicaInfo').mockReturnValue({ replicaId: 1, totalReplicas: 1 });
+    payjoin.InputPair.mockImplementation((txin: unknown) => ({ txin }));
+    payjoin.replayReceiverEventLog = jest.fn(() => {
+      const receiver = new payjoin.WantsInputs();
+      receiver.tryPreservingPrivacy = (pairs: any[]) => pairs[0];
+      receiver.contributeInputs = (pairs: any[]) => ({ commitInputs: () => ({ save: (persister: ReceiverPersister) => {
+        const point = pairs[0].txin.previousOutput;
+        persister.save(JSON.stringify({ CommittedInputs: {
+          receiver_inputs: [{ txin: { previous_output: `${point.txid}:${point.vout}` } }],
+        } }));
+        return {}; // Stop after selection/reservation; no signing or network mocks needed.
+      } }) });
+      return { state: () => ({ tag: 'WantsInputs', inner: { inner: receiver } }) };
+    });
+    db.receive.findMany.mockImplementation(async ({ where, select }: any) => {
+      if (where.session?.not === null) return rows;
+      if (select?.reservedInputTxid) return [...claims.values()].map(txid => ({ reservedInputTxid: txid, reservedInputVout: 0 }));
+      return [];
+    });
+    cnClient.listUnspent.mockImplementation(async () => {
+      expect(held).toBe(true);
+      return { result: { utxos: ['a', 'b'].map(c => ({ txid: c.repeat(64), vout: 0, amount: 0.001, confirmations: 1, scriptPubKey: 'bb' })) } };
+    });
+    cnClient.getTransaction.mockResolvedValue({ result: {} });
+    cnClient.getFeeRate = jest.fn().mockResolvedValue({ result: { feerate: 1 } });
+    cnClient.lockUnspent.mockResolvedValue({ result: { success: true } });
+    db.receive.update.mockImplementation(async ({ where, data }: any) => {
+      if (data.reservedInputTxid) {
+        expect(held).toBe(true);
+        expect([...claims.values()]).not.toContain(data.reservedInputTxid);
+        claims.set(where.id, data.reservedInputTxid);
+      }
+      return { ...rows.find(row => row.id === where.id), ...data };
+    });
+    try {
+      await restoreReceiveSessions(mockConfig as Config);
+      expect([...claims.values()]).toEqual(['a'.repeat(64), 'b'.repeat(64)]);
+      expect(cnClient.lockUnspent).toHaveBeenCalledTimes(2);
+      expect(db.receive.updateMany).not.toHaveBeenCalled();
+    } finally {
+      replica.mockRestore();
+      Object.assign(payjoin, previous);
+      delete payjoin.replayReceiverEventLog;
+      lock.acquire.mockImplementation((_key: unknown, fn: () => unknown) => fn());
+      db.receive.findMany.mockResolvedValue([]);
+      payjoin.InputPair.mockReset();
+    }
   });
 });

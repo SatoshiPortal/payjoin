@@ -2,11 +2,12 @@ import { payjoin } from "payjoin";
 import { db } from "../lib/db";
 import logger from "../lib/Log2File";
 import { Config } from "../config";
-import { Receive } from "@prisma/client";
+import { Prisma, Receive } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
+import { LockManager } from "../lib/Locker";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchBufferResponse, hexToArrayBuffer, randomRelay, recordRelayFailure, sessionHasPostedProposal } from "../lib/payjoin";
+import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchSessionResponse, hexToArrayBuffer, sessionHasPostedProposal } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 import { claimSeenInputsForSession, outpointKey, SeenInputConflictError, SeenOutpoint } from "../lib/seenInputs";
@@ -171,10 +172,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.HasReplyableError) {
         logger.info(processReceiveSession, 'Receiver is in HasReplyableError state — returning error response to sender');
 
-        const errReq = receiver.createErrorRequest(receiveSess.ohttpRelay ?? randomRelay());
+        let errReq: ReturnType<typeof receiver.createErrorRequest>;
         let errResponseBuffer: ArrayBuffer;
         try {
-          errResponseBuffer = await fetchBufferResponse(errReq.request);
+          ({ rr: errReq, responseBuffer: errResponseBuffer } = await fetchSessionResponse(receiveSess.bip21!, receiver.createErrorRequest.bind(receiver)));
         } catch (e) {
           // Same long-poll/timeout semantics as the proposal poll: a transient relay
           // timeout isn't a hard failure — retry on the next cron cycle.
@@ -206,10 +207,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.Initialized) {
         logger.debug(processReceiveSession, 'Receiver is in Initialized state');
 
-        const rr = receiver.createPollRequest(receiveSess.ohttpRelay ?? randomRelay());
+        let rr: ReturnType<typeof receiver.createPollRequest>;
         let responseBuffer: ArrayBuffer;
         try {
-          responseBuffer = await fetchBufferResponse(rr.request, config.OHTTP_LONGPOLL_TIMEOUT_MS);
+          ({ rr, responseBuffer } = await fetchSessionResponse(receiveSess.bip21!, receiver.createPollRequest.bind(receiver), true));
         } catch (e) {
           // The directory uses a long-poll (~30s) waiting for a sender's proposal.
           // Our client timeout fires first, producing ECONNABORTED. This is not a
@@ -393,27 +394,33 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       if (receiver instanceof payjoin.WantsInputs) {
         logger.debug(processReceiveSession, 'Receiver is in WantsInputs state');
 
-        // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
-        const inputs = await availableInputs(config, receiveSess.amount);
-        logger.debug(processReceiveSession, 'selected inputs:', inputs);
+        // Serialize selection and reservation across sessions and replicas sharing this wallet.
+        const reserved = await LockManager.runDetached(() => lock.acquire(`receive-inputs:${config.RECEIVE_WALLET}`, async () => {
+          // target the payment amount so the contributed input resembles a natural wallet-selected coin (see availableInputs)
+          const inputs = await availableInputs(config, receiveSess.amount);
+          logger.debug(processReceiveSession, 'selected inputs:', inputs);
 
-        if (inputs.length === 0) {
-          logger.error(processReceiveSession, 'no inputs found to contribute');
-          return;
-        }
+          if (inputs.length === 0) {
+            logger.error(processReceiveSession, 'no inputs found to contribute');
+            return null;
+          }
 
-        // The selected InputPair cannot be identified here: the FFI returns a
-        // freshly lifted wrapper object with no outpoint accessors. The
-        // committed outpoint is instead recovered from the CommittedInputs
-        // session event and reserved below, before any signing.
-        const inputPairs = inputs.map((input) => input.inputPair);
-        const selectedInput: payjoin.InputPairLike = receiver.tryPreservingPrivacy(inputPairs);
+          // The selected InputPair cannot be identified here: the FFI returns a
+          // freshly lifted wrapper object with no outpoint accessors. The
+          // committed outpoint is instead recovered from the CommittedInputs
+          // session event and reserved below, before any signing.
+          const inputPairs = inputs.map((input) => input.inputPair);
+          const selectedInput: payjoin.InputPairLike = receiver.tryPreservingPrivacy(inputPairs);
 
-        receiver = receiver.contributeInputs([selectedInput])
-          .commitInputs()
-          .save(persister);
+          receiver = receiver.contributeInputs([selectedInput])
+            .commitInputs()
+            .save(persister);
 
-        logger.debug('tryContributeInputs complete');
+          logger.debug('tryContributeInputs complete');
+          return reserveCommittedInput(receiveSess, persister.load(), config);
+        }));
+        if (!reserved) return;
+        receiveSess = reserved;
       }
 
       // Reserve the committed receiver input before signing (issue #8): record
@@ -422,7 +429,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
       // replayed sessions already past WantsInputs, so a crash between commit
       // and lock is healed here. Failing to reserve must abort before
       // finalizeProposal — never sign with an unreserved input.
-      if (
+      else if (
         receiver instanceof payjoin.WantsFeeRange ||
         receiver instanceof payjoin.ProvisionalProposal ||
         receiver instanceof payjoin.PayjoinProposal
@@ -583,8 +590,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         // flush persisted state before sending the proposal so a crash after send can replay correctly
         await persister.flush();
 
-        const rr = receiver.createPostRequest(receiveSess.ohttpRelay ?? randomRelay());
-        const responseBuffer = await fetchBufferResponse(rr.request);
+        const { rr, responseBuffer } = await fetchSessionResponse(receiveSess.bip21!, receiver.createPostRequest.bind(receiver));
 
         // Note: a success response here doesn't mean the sender accepted the PSBT.
         // Fallback tx broadcast is handled separately after a timeout if the payjoin tx is not seen.
@@ -613,10 +619,6 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
 
     } catch (e) {
       logger.error(processReceiveSession, 'failed to restore session:', describePayjoinError(e));
-
-      if (e instanceof AxiosError && e.code === 'ECONNABORTED' && receiveSess.ohttpRelay) {
-        recordRelayFailure(receiveSess.ohttpRelay);
-      }
 
       await db.receive.updateMany({
         where: { id: receiveSess.id, failedTs: null },
@@ -1200,6 +1202,14 @@ export async function broadcastFallback(receiveSess: Receive, config: Config) {
       txid: sendResult,
       fallbackTs: new Date(),
       amount: fallbackAmount,
+      senderInAmount: null,
+      senderOutAmount: null,
+      receiverInAmount: 0n,
+      receiverOutAmount: 0n,
+      txInputs: Prisma.DbNull,
+      txOutputs: Prisma.DbNull,
+      receiverFee: 0n,
+      fee: null, // The address callback supplies the actual fallback fee.
     }
   });
   logger.info(broadcastFallback, 'updated receive session with txid:', sendResult, updatedReceive.id);

@@ -163,24 +163,14 @@ async function cancelSend(params: { id: number }): Promise<{ id: number }> {
 async function getSend(params: { id: number }): Promise<{ id: number }> {
   logger.info(getSend, params);
 
-  return new Promise((resolve, reject) => {
-    lock.acquire(params.id.toString(), async () => {
-      try {
-        const { id } = params;
-
-        const send = await db.send.findUnique({ where: { id } });
-
-        if (!send) {
-          throw new JSONRPCErrorException('Send session not found', JSONRPCErrorCode.InvalidParams);
-        }
-
-        return appendSendStatus(send);
-      } catch (e) {
-        logger.error(getSend, 'Failed to get send:', e);
-        throw new JSONRPCErrorException('Failed to get send', JSONRPCErrorCode.InternalError);
-      }
-    })
-    .then(resolve)
-    .catch(reject);
-  });
+  try {
+    const send = await db.send.findUnique({ where: { id: params.id } });
+    if (!send) {
+      throw new JSONRPCErrorException('Send session not found', JSONRPCErrorCode.InvalidParams);
+    }
+    return appendSendStatus(send);
+  } catch (e) {
+    logger.error(getSend, 'Failed to get send:', e);
+    throw new JSONRPCErrorException('Failed to get send', JSONRPCErrorCode.InternalError);
+  }
 }

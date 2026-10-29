@@ -62,9 +62,9 @@ const { db } = require('../lib/db');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { payjoin: payjoinSdk } = require('payjoin');
 
-const mockConfig: Pick<Config, 'SEND_WALLET' | 'OHTTP_RELAYS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE' | 'SEND_PAYJOIN_CUTOFF'> = {
+const mockConfig: Pick<Config, 'SEND_WALLET' | 'PAYJOIN_SERVERS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE' | 'SEND_PAYJOIN_CUTOFF'> = {
   SEND_WALLET: '01',
-  OHTTP_RELAYS: ['https://relay.example.com'],
+  PAYJOIN_SERVERS: ['https://relay.example.com'],
   MAX_PAYJOIN_FEE_RATE: 500, // sat/vbyte — reject anything above this in tests
   RESERVATION_RELEASE_GRACE: 1800, // 30m
   SEND_PAYJOIN_CUTOFF: 900, // 15m

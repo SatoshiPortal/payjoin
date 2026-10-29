@@ -1,5 +1,5 @@
-import { handleAddressCallback } from './address';
-import { Receive } from '@prisma/client';
+import { handleAddressCallback, retryAddressCallbacks } from './address';
+import { Prisma, Receive } from '@prisma/client';
 import { config } from '../../config';
 import Utils from '../../lib/Utils';
 
@@ -24,11 +24,15 @@ jest.mock('../../lib/globals', () => ({
 jest.mock('../../lib/db', () => ({
   db: {
     receive: {
+      findMany: jest.fn(),
+      findUnique: jest.fn(),
       findFirst: jest.fn(),
       update: jest.fn(),
       count: jest.fn(),
     },
     send: {
+      findMany: jest.fn(),
+      findUnique: jest.fn(),
       findFirst: jest.fn(),
       update: jest.fn(),
       count: jest.fn(),
@@ -115,7 +119,7 @@ function webhookData(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   cnClient.decodeRawTransaction.mockResolvedValue({});
-  jest.spyOn(Utils, 'post').mockResolvedValue(true);
+  jest.spyOn(Utils, 'post').mockResolvedValue({ status: 200 });
   cnClient.getTransaction.mockImplementation(async (txid: string) => ({
     result: {
       txid,
@@ -345,6 +349,26 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     expect(Utils.post).toHaveBeenCalled();
   });
 
+  it.each(['fallbackTs', 'nonPayjoinTs'])('clears stale proposal details when the txid matches and %s is set', async (status) => {
+    const row = makeReceiveRow({
+      txid: REAL_TXID, [status]: new Date(), fee: 1500n, receiverFee: 475n,
+      senderInAmount: 2000000n, senderOutAmount: 1739012n,
+      receiverInAmount: 10000000n, receiverOutAmount: 10259525n,
+      txInputs: [{ txid: GUESSED_TXID }], txOutputs: [{ value: 10259525 }],
+    });
+    db.receive.findFirst.mockResolvedValue(row);
+    db.receive.update.mockResolvedValue(row);
+
+    await handleAddressCallback(webhookData({ fees: 0.00000987 }), 'receive', CALLBACK_TOKEN);
+
+    expect(db.receive.update.mock.calls[0][0].data).toEqual(expect.objectContaining({
+      fee: 987n, receiverFee: 0n,
+      senderInAmount: null, senderOutAmount: null,
+      receiverInAmount: 0n, receiverOutAmount: 0n,
+      txInputs: Prisma.DbNull, txOutputs: Prisma.DbNull,
+    }));
+  });
+
   it('takes the normal update path without checking listUnspent when the txid already matches', async () => {
     const row = makeReceiveRow({ txid: REAL_TXID, reservedInputTxid: RESERVED_TXID, reservedInputVout: RESERVED_VOUT });
     db.receive.findFirst.mockResolvedValue(row);
@@ -403,9 +427,16 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
       where: { id: row.id },
       data: {
         amount: Utils.btcToSats(0.0024943),
+        calledBackTs: null,
+        firstSeenTs: expect.any(Date),
         receiverFee: 0n,
         receiverInAmount: 0n,
         receiverOutAmount: 0n,
+        senderInAmount: null,
+        senderOutAmount: null,
+        txInputs: Prisma.DbNull,
+        txOutputs: Prisma.DbNull,
+        fee: 2381n,
         txid: REAL_TXID,
         nonPayjoinTs: expect.any(Date),
       },
@@ -447,9 +478,16 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     const data = db.receive.update.mock.calls[0][0].data;
     expect(data).toEqual({
       amount: Utils.btcToSats(0.0024943),
+      calledBackTs: null,
+      firstSeenTs: expect.any(Date),
       receiverFee: 0n,
       receiverInAmount: 0n,
       receiverOutAmount: 0n,
+      senderInAmount: null,
+      senderOutAmount: null,
+      txInputs: Prisma.DbNull,
+      txOutputs: Prisma.DbNull,
+      fee: 2381n,
     });
     expect(data).not.toHaveProperty('nonPayjoinTs');
   });
@@ -590,6 +628,12 @@ describe('handleAddressCallback — sender fallback fee', () => {
       data: expect.objectContaining({
         fee: 987n,
         senderFee: 987n,
+        senderInAmount: null,
+        senderOutAmount: null,
+        receiverInAmount: 0n,
+        receiverOutAmount: 0n,
+        txInputs: Prisma.DbNull,
+        txOutputs: Prisma.DbNull,
         fallbackTs: fallbackTs ?? expect.any(Date),
       }),
     });
@@ -618,6 +662,54 @@ describe('handleAddressCallback — sender fallback fee', () => {
     expect(Utils.post).toHaveBeenCalledWith(CALLBACK_URL, expect.objectContaining({
       senderFee: '800',
       status: 'unconfirmed',
+    }));
+  });
+});
+
+
+describe('callback delivery retries', () => {
+  it.each(['send', 'receive'] as const)('retries failed %s confirmations after an earlier successful unconfirmed callback', async type => {
+    let row: any = makeReceiveRow({ txid: REAL_TXID, calledBackTs: new Date(0) });
+    const model = db[type];
+    model.findFirst.mockImplementation(async () => row);
+    model.findUnique.mockImplementation(async () => row);
+    model.update.mockImplementation(async ({ data }: any) => { row = { ...row, ...data }; return row; });
+    db.send.findMany.mockResolvedValue([]);
+    db.receive.findMany.mockResolvedValue([]);
+    model.findMany.mockImplementation(async () => row.calledBackTs ? [] : [{ id: row.id, address: row.address }]);
+    cnClient.getTransaction.mockResolvedValue({ result: {
+      txid: REAL_TXID, confirmations: 1,
+      vout: [{ value: 0.001, scriptPubKey: { address: RECEIVE_ADDRESS } }],
+    } });
+    (Utils.post as jest.Mock).mockResolvedValue({ status: 400 });
+    await handleAddressCallback(webhookData({ txid: REAL_TXID, confirmations: 1 }), type, CALLBACK_TOKEN);
+    expect(row.confirmedTs).toBeInstanceOf(Date);
+    expect(row.calledBackTs).toBeNull();
+    expect(cnClient.unwatch).toHaveBeenCalled();
+
+    for (const status of [-1, 500]) {
+      (Utils.post as jest.Mock).mockResolvedValue({ status });
+      await retryAddressCallbacks();
+      expect(row.calledBackTs).toBeNull();
+    }
+    (Utils.post as jest.Mock).mockResolvedValue({ status: 204 });
+    await retryAddressCallbacks();
+    expect(row.calledBackTs).toBeInstanceOf(Date);
+    expect(Utils.post).toHaveBeenLastCalledWith(CALLBACK_URL, expect.objectContaining({ status: 'confirmed' }));
+    expect(cnClient.getTransaction).toHaveBeenCalledTimes(1);
+    const attempts = (Utils.post as jest.Mock).mock.calls.length;
+    await retryAddressCallbacks();
+    expect(Utils.post).toHaveBeenCalledTimes(attempts);
+  });
+
+  it('rechecks delivery under the address lock before retrying', async () => {
+    db.send.findMany.mockResolvedValue([{ id: 1, address: RECEIVE_ADDRESS }]);
+    db.receive.findMany.mockResolvedValue([]);
+    db.send.findUnique.mockResolvedValue(makeReceiveRow({ calledBackTs: new Date() }));
+    await retryAddressCallbacks();
+    expect(Utils.post).not.toHaveBeenCalled();
+    expect(db.receive.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ firstSeenTs: { not: null } }),
     }));
   });
 });

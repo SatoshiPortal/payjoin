@@ -92,6 +92,11 @@ export class LockManager {
     return result.rows as T[];
   }
 
+  // Fire-and-forget work must not join its caller's advisory-lock transaction.
+  static runDetached<T>(work: () => T): T {
+    return LockManager._asyncStorage.exit(work);
+  }
+
   async close() {
     await this._pool.end();
   }

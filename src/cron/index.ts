@@ -5,6 +5,7 @@ import { restoreReceiveSessions } from "./receive";
 import { lock } from "../lib/globals";
 import Utils from '../lib/Utils';
 import { isShuttingDown, trackTask } from '../lib/gracefulShutdownRefs';
+import { retryAddressCallbacks } from '../api/callback/address';
 
 const lockName = "sessions";
 const CRON_JITTER_RATIO = 0.3; // add up to +30% random delay per tick so polling isn't a fixed-period beacon
@@ -41,6 +42,7 @@ export function startCron(config: Config) {
           ]);
           logger.info(runJob, "Sessions processed. Releasing lock");
         });
+        await retryAddressCallbacks();
       } catch (e) {
         logger.error(runJob, "Failed to run job:", e);
       }

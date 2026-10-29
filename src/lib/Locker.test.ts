@@ -491,6 +491,42 @@ describe("LockManager", () => {
     });
   });
 
+  it("serializes independent locks inside a shared parent transaction", async () => {
+    const clients: any[] = [];
+    mockConnect.mockImplementation(async () => {
+      const client = {
+        query: jest.fn().mockResolvedValue({ rows: [{ locked: "true" }] }),
+        release: jest.fn(), on: jest.fn(), removeListener: jest.fn(),
+      };
+      clients.push(client);
+      return client;
+    });
+    const manager = new LockManager();
+    let releaseFirst!: () => void;
+    let enteredFirst!: () => void;
+    const firstEntered = new Promise<void>(resolve => { enteredFirst = resolve; });
+    const firstRelease = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const second = jest.fn(async () => {
+      expect(clients[1].query).toHaveBeenCalledWith("COMMIT");
+    });
+    await manager.acquire("cron-parent", async () => {
+      const first = LockManager.runDetached(() => manager.acquire("wallet-inputs", async () => {
+        enteredFirst();
+        await firstRelease;
+      }));
+      await firstEntered;
+      const next = LockManager.runDetached(() => manager.acquire("wallet-inputs", second));
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(second).not.toHaveBeenCalled();
+      releaseFirst();
+      await Promise.all([first, next]);
+      expect(clients[0].query).not.toHaveBeenCalledWith("COMMIT");
+    });
+    expect(clients).toHaveLength(3);
+    expect(second).toHaveBeenCalledTimes(1);
+    await manager.close();
+  });
+
   describe("hashStringToInt", () => {
     it("should generate the same hash for the same string", () => {
       const hashFn = (lockManager as any).hashStringToInt.bind(lockManager);

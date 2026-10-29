@@ -13,9 +13,8 @@ export interface Config {
   SEND_WALLET: string; // the wallet to use for sending from (e.g. "01", "02", etc)
   RECEIVE_WALLET: string; // the wallet to use for receiving addresses to (e.g. "01", "02", etc)
   OWNED_WALLETS: string[]; // wallet indices a caller-supplied receive address must belong to (e.g. ["02", "01"])
-  PAYJOIN_DIRECTORY: string; // the directory server where the payjoin data is stored
+  PAYJOIN_SERVERS: string[]; // each server can be a directory or an OHTTP relay
   PAYJOIN_RECEIVE_EXPIRY: bigint; // the number of seconds before a payjoin request expires
-  OHTTP_RELAYS: string[]; // ordered list of ohttp relay URLs to try in sequence
   OHTTP_RELAY_TIMEOUT_MS: number; // per-relay timeout in milliseconds for quick requests (key fetch, proposal post)
   OHTTP_LONGPOLL_TIMEOUT_MS: number; // timeout for directory long-poll requests; should exceed the directory's ~30s long-poll window
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
@@ -63,9 +62,8 @@ export let config: Config = {
   OWNED_WALLETS: bootOwnedWallets
     ? parseWalletList(bootOwnedWallets)
     : defaultOwnedWallets(receiveWallet, sendWallet),
-  PAYJOIN_DIRECTORY: process.env.PAYJOIN_DIRECTORY || "https://payjo.in",
+  PAYJOIN_SERVERS: (process.env.PAYJOIN_SERVERS || "https://pj.bullbitcoin.com,https://pj.bobspacebkk.com,https://payjoin.lab.vinteum.org,https://pj.pow.plan-b.foundation").split(',').map(s => s.trim()),
   PAYJOIN_RECEIVE_EXPIRY: BigInt(process.env.PAYJOIN_RECEIVE_EXPIRY  || 300), // 5 minutes - to be inline roughly with the order expiry
-  OHTTP_RELAYS: process.env.OHTTP_RELAYS ? process.env.OHTTP_RELAYS.split(',').map(s => s.trim()) : ["https://ohttp.cakewallet.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com"],
   OHTTP_RELAY_TIMEOUT_MS: Number(process.env.OHTTP_RELAY_TIMEOUT_MS || 10000),
   OHTTP_LONGPOLL_TIMEOUT_MS: Number(process.env.OHTTP_LONGPOLL_TIMEOUT_MS || 35000),
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",

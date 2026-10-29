@@ -1,4 +1,5 @@
-import { receive } from './index';
+import { receive, registerReceiveApi } from './index';
+import { addJsonRpcMethod } from '..';
 import { IReqReceive } from '../../types/api/receive';
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,7 @@ jest.mock('../../lib/payjoin', () => ({
 }));
 
 jest.mock('../../lib/db', () => ({
-  db: { receive: { create: jest.fn(), update: jest.fn() } },
+  db: { receive: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn() } },
 }));
 
 jest.mock('../../lib/globals', () => ({
@@ -58,6 +59,20 @@ const { createReceiver } = require('../../lib/payjoin');
 const { db } = require('../../lib/db');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { cnClient } = require('../../lib/globals');
+
+it('allows callback read-back while the session lock is held', async () => {
+  const { lock } = require('../../lib/globals');
+  const implementation = lock.acquire.getMockImplementation();
+  lock.acquire.mockImplementation(() => { throw new Error('session lock held'); });
+  try {
+    registerReceiveApi();
+    const getReceive = (addJsonRpcMethod as jest.Mock).mock.calls.find(([name]) => name === 'getReceive')[1];
+    db.receive.findUnique.mockResolvedValue({ id: 1, confirmedTs: new Date() });
+    await expect(getReceive({ id: 1 })).resolves.toMatchObject({ id: 1, confirmedTs: expect.any(Date) });
+  } finally {
+    lock.acquire.mockImplementation(implementation);
+  }
+});
 
 const CALLER_ADDRESS = 'bcrt1qu2xt7tsqastdgv2pnresamwm4t6je5lgtmfkvh';
 const DERIVED_ADDRESS = 'bcrt1qs0llzk5lzreev7mrwldrqmw3rs340u9qmx9dc8';

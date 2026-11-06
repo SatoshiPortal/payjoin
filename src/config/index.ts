@@ -19,6 +19,8 @@ export interface Config {
   OHTTP_LONGPOLL_TIMEOUT_MS: number; // timeout for directory long-poll requests; should exceed the directory's ~30s long-poll window
   OUTPUT_SUBSTITUTION_ENABLED: boolean; // when false, receiver never substitutes its output (keeps original BIP21 address on-chain)
   MAX_PAYJOIN_FEE_RATE: number; // sat/vbyte — reject payjoin proposals whose fee rate exceeds this ceiling
+  MAX_PAYJOIN_FEE: bigint; // sats — total transaction fee ceiling, including the original/fallback
+  MAX_PAYJOIN_ADDITIONAL_FEE: bigint; // sats — our extra contribution, as sender or receiver
   RESERVATION_RELEASE_GRACE: number; // seconds past expiryTs before an unbroadcast send lock is force-released
   SEND_PAYJOIN_CUTOFF: number; // seconds from send creation before we give up on payjoin and broadcast the original
 }
@@ -67,7 +69,9 @@ export let config: Config = {
   OHTTP_RELAY_TIMEOUT_MS: Number(process.env.OHTTP_RELAY_TIMEOUT_MS || 10000),
   OHTTP_LONGPOLL_TIMEOUT_MS: Number(process.env.OHTTP_LONGPOLL_TIMEOUT_MS || 35000),
   OUTPUT_SUBSTITUTION_ENABLED: process.env.OUTPUT_SUBSTITUTION_ENABLED?.toLowerCase() === "true",
-  MAX_PAYJOIN_FEE_RATE: Number(process.env.MAX_PAYJOIN_FEE_RATE || 500), // 500 sat/vbyte default
+  MAX_PAYJOIN_FEE_RATE: Number(process.env.MAX_PAYJOIN_FEE_RATE || 250), // 250 sat/vbyte default
+  MAX_PAYJOIN_FEE: BigInt(process.env.MAX_PAYJOIN_FEE || 50000),
+  MAX_PAYJOIN_ADDITIONAL_FEE: BigInt(process.env.MAX_PAYJOIN_ADDITIONAL_FEE || 10000),
   RESERVATION_RELEASE_GRACE: Number(process.env.RESERVATION_RELEASE_GRACE || 1800), // 30m default for unbroadcast send locks; posted receive reservations require a confirmed outcome
   SEND_PAYJOIN_CUTOFF: Number(process.env.SEND_PAYJOIN_CUTOFF || 900), // 15m; caps the receiver's BIP21 expiry, which is often 24h+
 };

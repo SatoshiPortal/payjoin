@@ -62,10 +62,12 @@ const { db } = require('../lib/db');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { payjoin: payjoinSdk } = require('payjoin');
 
-const mockConfig: Pick<Config, 'SEND_WALLET' | 'PAYJOIN_SERVERS' | 'MAX_PAYJOIN_FEE_RATE' | 'RESERVATION_RELEASE_GRACE' | 'SEND_PAYJOIN_CUTOFF'> = {
+const mockConfig: Pick<Config, 'SEND_WALLET' | 'PAYJOIN_SERVERS' | 'MAX_PAYJOIN_FEE_RATE' | 'MAX_PAYJOIN_FEE' | 'MAX_PAYJOIN_ADDITIONAL_FEE' | 'RESERVATION_RELEASE_GRACE' | 'SEND_PAYJOIN_CUTOFF'> = {
   SEND_WALLET: '01',
   PAYJOIN_SERVERS: ['https://relay.example.com'],
-  MAX_PAYJOIN_FEE_RATE: 500, // sat/vbyte — reject anything above this in tests
+  MAX_PAYJOIN_FEE_RATE: 250, // sat/vbyte — reject anything above this in tests
+  MAX_PAYJOIN_FEE: 50000n,
+  MAX_PAYJOIN_ADDITIONAL_FEE: 10000n,
   RESERVATION_RELEASE_GRACE: 1800, // 30m
   SEND_PAYJOIN_CUTOFF: 900, // 15m
 };
@@ -149,6 +151,20 @@ describe('validateAndBroadcastPayjoinPsbt — fee-rate guard', () => {
     expect(cnClient.sendRawTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ hex: TX_HEX }),
     );
+  });
+
+  it('rejects a large absolute fee even below the rate ceiling, before signing', async () => {
+    setupMocks(100, 501); // 50,100 sats at just 100 sat/vbyte
+    await expect(validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config))
+      .rejects.toThrow('transaction fee');
+    expect(cnClient.processPsbt).not.toHaveBeenCalled();
+    expect(cnClient.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts exactly the absolute fee ceiling', async () => {
+    setupMocks(100, 500);
+    await validateAndBroadcastPayjoinPsbt(PROPOSAL_PSBT, mockSendSess, mockConfig as Config);
+    expect(cnClient.sendRawTransaction).toHaveBeenCalled();
   });
 
   it('decodes proposal PSBT before signing and broadcasts in correct order', async () => {

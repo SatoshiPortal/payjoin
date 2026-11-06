@@ -5,7 +5,7 @@ import { Config } from "../config";
 import { Prisma, Send } from "@prisma/client";
 import { lock, cnClient, syncCnClient } from "../lib/globals";
 import Utils from "../lib/Utils";
-import { arrayBufferToHex, extractFeeFromPsbt, fetchBufferResponse, fetchSessionResponse, withRelayFallback } from "../lib/payjoin";
+import { arrayBufferToHex, assertFeeLimits, extractFeeFromPsbt, fetchBufferResponse, fetchSessionResponse, withRelayFallback } from "../lib/payjoin";
 import { SenderPersister } from "../lib/persister";
 import { FallbackOutcome } from "../types/payjoin";
 import { AxiosError } from "axios";
@@ -144,6 +144,8 @@ export async function validateAndBroadcastPayjoinPsbt(
     );
     return;
   }
+
+  assertFeeLimits(decodedProposal, config);
 
   const { error: processedError, result: processedResult } = await cnClient.processPsbt({
     psbt: psbtBase64,

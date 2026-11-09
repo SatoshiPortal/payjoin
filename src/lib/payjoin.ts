@@ -1,4 +1,4 @@
-import { config } from "../config";
+import { config, Config } from "../config";
 import { payjoin } from "payjoin";
 import Utils from "./Utils";
 import { Receive, Send } from "@prisma/client";
@@ -324,6 +324,10 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
   if (feeError || !feeResult) {
     throw new Error(`Failed to get fee rate: ${feeError}`);
   }
+  const feeRate = Number(feeResult.feerate);
+  if (!Number.isFinite(feeRate) || feeRate <= 0 || feeRate > config.MAX_PAYJOIN_FEE_RATE) {
+    throw new Error('Invalid or excessive funding fee rate');
+  }
 
   // Set nLockTime explicitly to the current block height to match the bdk-based
   // mobile wallet, which always uses the exact chain tip for anti-fee-sniping.
@@ -358,6 +362,13 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
   }
   const lockedInputs = decodeResult.tx.vin.map((vin) => ({ txid: vin.txid, vout: vin.vout }));
   await db.send.update({ where: { id: Number(id) }, data: { lockedInputs } });
+  assertFeeLimits(decodeResult, config);
+
+  const changeIndex = psbtResult.changepos;
+  const change = changeIndex >= 0 ? Utils.btcToSats(decodeResult.tx.vout[changeIndex].value) : 0n;
+  const contribution = [BigInt(Math.ceil(68 * feeRate)), config.MAX_PAYJOIN_ADDITIONAL_FEE,
+    config.MAX_PAYJOIN_FEE - extractFeeFromPsbt(decodeResult), change > 546n ? change - 546n : 0n]
+    .reduce((a, b) => a < b ? a : b);
 
   const { error: processedPsbtError, result: processedPsbtResult } = await cnClient.processPsbt({
     psbt: psbtResult.psbt,
@@ -389,9 +400,10 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
 
   const persister = new SenderPersister({ id, db });
 
-  new payjoin.SenderBuilder(psbt, pjUri)
-    .buildRecommended(1n)
-    .save(persister);
+  const builder = new payjoin.SenderBuilder(psbt, pjUri);
+  (contribution > 0n
+    ? builder.buildWithAdditionalFee(contribution, changeIndex, 1n, false)
+    : builder.buildNonIncentivizing(1n)).save(persister);
 
   return {
     psbt,
@@ -449,15 +461,31 @@ export function appendSendStatus(send: Send) {
   } as IRespSend;
 }
 
+export function assertFeeLimits(decodedPsbt: NonNullable<IRespDecodePsbt['result']>, limits: Config) {
+  const fee = extractFeeFromPsbt(decodedPsbt);
+  const vsize = decodedPsbt.tx.vsize;
+  if (!Number.isFinite(limits.MAX_PAYJOIN_FEE_RATE) || limits.MAX_PAYJOIN_FEE_RATE <= 0
+    || typeof limits.MAX_PAYJOIN_FEE !== 'bigint' || limits.MAX_PAYJOIN_FEE < 0n
+    || typeof limits.MAX_PAYJOIN_ADDITIONAL_FEE !== 'bigint' || limits.MAX_PAYJOIN_ADDITIONAL_FEE < 0n
+    || !Number.isFinite(vsize) || vsize <= 0 || fee < 0n || fee > limits.MAX_PAYJOIN_FEE
+    || Number(fee) / vsize > limits.MAX_PAYJOIN_FEE_RATE) {
+    throw new Error('Invalid or excessive transaction fee');
+  }
+}
+
 export function extractFeeFromPsbt(decodedPsbt: NonNullable<IRespDecodePsbt['result']>) {
-  if (decodedPsbt.fee) {
+  if (decodedPsbt.fee !== undefined) {
     return Utils.btcToSats(decodedPsbt.fee);
   }
 
   // calculate the total input amount
   const totalInputAmount = decodedPsbt.inputs
-    .filter((input) => input.witness_utxo)
-    .reduce((acc, input) => acc + Utils.btcToSats(input.witness_utxo?.amount || 0), 0n);
+    .reduce((acc, input, index) => {
+      const amount = input.witness_utxo?.amount
+        ?? input.non_witness_utxo?.vout?.[decodedPsbt.tx.vin[index].vout]?.value;
+      if (amount === undefined) throw new Error('Missing PSBT input value');
+      return acc + Utils.btcToSats(amount);
+    }, 0n);
 
   // calculate the total output amount
   const totalOutputAmount = decodedPsbt.tx.vout

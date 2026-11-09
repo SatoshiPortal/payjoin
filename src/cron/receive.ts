@@ -7,7 +7,7 @@ import { lock, cnClient, syncCnClient } from "../lib/globals";
 import { LockManager } from "../lib/Locker";
 import Utils from "../lib/Utils";
 import { AxiosError } from "axios";
-import { arrayBufferToHex, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchSessionResponse, hexToArrayBuffer, sessionHasPostedProposal } from "../lib/payjoin";
+import { arrayBufferToHex, assertFeeLimits, describePayjoinError, extractCommittedInputs, extractFeeFromPsbt, extractReplyableError, fetchSessionResponse, hexToArrayBuffer, sessionHasPostedProposal } from "../lib/payjoin";
 import { addressCallbackUrl } from "../api/callback/address";
 import { ReceiverPersister } from "../lib/persister";
 import { claimSeenInputsForSession, outpointKey, SeenInputConflictError, SeenOutpoint } from "../lib/seenInputs";
@@ -449,27 +449,19 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           logger.error(processReceiveSession, 'failed to get fee rate:', maxFeeError);
           return;
         }
-        logger.info(processReceiveSession, 'max fee rate:', maxFeeResult?.feerate);
+        const maxFeeRate = Math.min(config.MAX_PAYJOIN_FEE_RATE, Math.ceil(Number(maxFeeResult!.feerate) * 1.5));
+        logger.info(processReceiveSession, 'max fee rate:', maxFeeRate);
 
-        receiver = receiver.applyFeeRange(BigInt(minFeeResult!.feerate), BigInt(maxFeeResult!.feerate)).save(persister);
+        receiver = receiver.applyFeeRange(BigInt(minFeeResult!.feerate), BigInt(maxFeeRate)).save(persister);
       }
       
-      if (receiver instanceof payjoin.ProvisionalProposal) {
-        logger.debug(processReceiveSession, 'Receiver is in ProvisionalProposal state');
+      if (receiver instanceof payjoin.ProvisionalProposal || receiver instanceof payjoin.PayjoinProposal) {
+        logger.debug(processReceiveSession, 'Checking proposal fee budgets');
 
-        receiver = receiver.finalizeProposal(
-          { callback: (psbt: string) => walletProcessPsbt(psbt, config) }
-        )
-        .save(persister);
-      }
-      
-      if (receiver instanceof payjoin.PayjoinProposal) {
-        logger.debug(processReceiveSession, 'Receiver is in PayjoinProposal state');
+        const finalPsbt = receiver instanceof payjoin.ProvisionalProposal ? receiver.psbtToSign() : receiver.psbt();
+        logger.info(processReceiveSession, 'proposal psbt:', finalPsbt);
 
-        const finalPsbt = receiver.psbt();
-        logger.info(processReceiveSession, 'finalized proposal psbt:', finalPsbt);
-
-        // Decode and validate amounts BEFORE sending the proposal so we can abort cleanly
+        // Decode and validate amounts BEFORE signing or sending the proposal so we can abort cleanly
         // if the receiver would lose money.
         const { error: decodedFinalPsbtError, result: decodedFinalPsbtResult } = await cnClient.decodePsbt({ psbt: finalPsbt });
         if (decodedFinalPsbtError || !decodedFinalPsbtResult) {
@@ -481,6 +473,7 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         let totalFee = 0n, receiverFee = 0n, receiverTotalInputAmount = 0n, receiverTotalOutputAmount = 0n;
 
         totalFee = extractFeeFromPsbt(decodedFinalPsbtResult);
+        assertFeeLimits(decodedFinalPsbtResult, config);
         logger.debug(processReceiveSession, 'total fee:', totalFee);
 
         // classify by the reserved outpoint rather than a fresh listunspent —
@@ -542,8 +535,10 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
           if (fbError || !fbResult) {
             logger.warn(processReceiveSession, 'could not decode fallback tx to compute sender payment:', fbError);
           } else {
+            // The stored address may already be substituted on a resumed session.
+            const originalAddress = payjoin.Uri.parse(receiveSess.bip21!).checkPjSupported().address();
             senderPaymentAmount = fbResult.tx.vout
-              .filter(vout => vout.scriptPubKey.address === originalReceiverAddress)
+              .filter(vout => vout.scriptPubKey.address === originalAddress)
               .reduce((acc, vout) => acc + Utils.btcToSats(vout.value), 0n);
           }
         }
@@ -553,6 +548,9 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
         // in case senderPaymentAmount is unknown (0n) or netReceived somehow exceeds it.
         const rawReceiverFee = senderPaymentAmount - netReceived;
         receiverFee = rawReceiverFee > 0n ? rawReceiverFee : 0n;
+        if (senderPaymentAmount <= 0n || receiverFee > config.MAX_PAYJOIN_ADDITIONAL_FEE) {
+          throw new Error('Unknown payment amount or excessive receiver fee contribution');
+        }
         logger.debug(processReceiveSession, 'receiver fee:', receiverFee, 'sender payment:', senderPaymentAmount, 'net received:', netReceived);
 
         // amount = what the sender actually paid = netReceived + receiver's fee contribution.
@@ -578,6 +576,14 @@ async function processReceiveSession(receiveSess: Receive, config: Config) {
             `netReceived=${calculatedAmount}, expected=${receiveSess.amount}`
           );
         }
+
+        // Check both budgets before giving the wallet anything to sign, including on replay.
+        if (receiver instanceof payjoin.ProvisionalProposal) {
+          receiver = receiver.finalizeProposal(
+            { callback: (psbt: string) => walletProcessPsbt(psbt, config) }
+          ).save(persister);
+        }
+        if (!(receiver instanceof payjoin.PayjoinProposal)) return;
 
         const txid = decodedFinalPsbtResult.tx.txid;
         logger.debug(processReceiveSession, 'proposal txid:', txid);

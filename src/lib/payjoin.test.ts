@@ -4,9 +4,9 @@
 
 jest.mock('payjoin', () => ({
   payjoin: {
-    // createSender() does `new payjoin.SenderBuilder(psbt, pjUri).buildRecommended(1n).save(persister)`
     SenderBuilder: jest.fn().mockImplementation(() => ({
-      buildRecommended: jest.fn().mockReturnThis(),
+      buildWithAdditionalFee: jest.fn().mockReturnThis(),
+      buildNonIncentivizing: jest.fn().mockReturnThis(),
       save: jest.fn(),
     })),
   },
@@ -50,7 +50,7 @@ jest.mock('./persister', () => ({
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
-import { extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal, createSender, sendPayjoinDeadline } from './payjoin';
+import { assertFeeLimits, extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal, createSender, sendPayjoinDeadline } from './payjoin';
 import { ReceiveStatus, SendStatus } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
 import { config } from '../config';
@@ -169,6 +169,12 @@ describe('extractFeeFromPsbt', () => {
     expect(extractFeeFromPsbt(psbt as any)).toBe(100_000n);
   });
 
+  it('includes legacy input values when Core omits the fee field', () => {
+    const psbt = { inputs: [{ non_witness_utxo: { vout: [{ value: 0.001 }] } }],
+      tx: { vin: [{ vout: 0 }], vout: [{ value: 0.00099 }] } };
+    expect(extractFeeFromPsbt(psbt as any)).toBe(1000n);
+  });
+
   it('calculates fee from inputs minus outputs when fee field is absent', () => {
     const scriptPubKey = { asm: '', desc: '', hex: '', reqSigs: 0, type: 'p2wpkh' };
     const psbt = makePsbt({
@@ -185,17 +191,16 @@ describe('extractFeeFromPsbt', () => {
     expect(extractFeeFromPsbt(psbt as any)).toBe(10_000n);
   });
 
-  it('skips inputs without witness_utxo when calculating fee', () => {
+  it('rejects missing input values instead of undercounting fees', () => {
     const scriptPubKey = { asm: '', desc: '', hex: '', reqSigs: 0, type: 'p2wpkh' };
     const psbt = makePsbt({
       inputs: [
         { witness_utxo: { amount: 0.5, scriptPubKey: { asm: '', desc: '', hex: '', type: '' } } },
-        {},  // no witness_utxo — must be ignored
+        {},
       ],
       vout: [{ value: 0.499, n: 0, scriptPubKey }],
     });
-    // 50 000 000 - 49 900 000 = 100 000
-    expect(extractFeeFromPsbt(psbt as any)).toBe(100_000n);
+    expect(() => extractFeeFromPsbt(psbt as any)).toThrow('Missing PSBT input value');
   });
 
   it('returns 0n when inputs exactly equal outputs (no fee)', () => {
@@ -638,12 +643,55 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     cnClient.getFeeRate.mockResolvedValue({ result: { feerate: 5 }, error: null });
     cnClient.getblockchaininfo.mockResolvedValue({ result: { blocks: 100 }, error: null });
     cnClient.createFundedPsbt.mockResolvedValue({ result: { psbt: FUNDED_PSBT, fee: 0.00001, changepos: 1 }, error: null });
-    cnClient.decodePsbt.mockResolvedValue({ result: { inputs: [], outputs: [], tx: rawTxWithVin(LOCKED_VIN) }, error: null });
+    cnClient.decodePsbt.mockResolvedValue({ result: { fee: 0.00001, inputs: [], outputs: [],
+      tx: { ...rawTxWithVin(LOCKED_VIN), vout: [{ value: 0.001 }, { value: 0.01 }] } }, error: null });
     cnClient.processPsbt.mockResolvedValue({ result: { psbt: 'signed', complete: true }, error: null });
     cnClient.finalizePsbt.mockResolvedValue({ result: { hex: FALLBACK_HEX, psbt: 'signed' }, error: null });
   }
 
   beforeEach(() => jest.clearAllMocks());
+
+  it.each([
+    [1, 1000000, 68n], [5, 1000000, 340n], [250, 1000000, 10000n],
+    [5, 600, 54n], [5, 546, 0n], [5, 0, 0n],
+  ])('bounds the offer at rate %s with %s sats change', async (rate, change, expected) => {
+    setupHappyPath();
+    cnClient.getFeeRate.mockResolvedValue({ result: { feerate: rate } });
+    const decoded = (await cnClient.decodePsbt()).result;
+    decoded.tx.vout[1].value = change / 1e8;
+    await createSender({ id: 7, pjUri: {} as never, amount: 100000n, address: 'bcrt1qtest' });
+    const builder = require('payjoin').payjoin.SenderBuilder.mock.results.at(-1).value;
+    if (expected) expect(builder.buildWithAdditionalFee).toHaveBeenCalledWith(expected, 1, 1n, false);
+    else expect(builder.buildNonIncentivizing).toHaveBeenCalledWith(1n);
+  });
+
+  it('caps the offer by the remaining total-fee budget', async () => {
+    setupHappyPath();
+    const decoded = (await cnClient.decodePsbt()).result;
+    decoded.fee = 49999 / 1e8;
+    decoded.tx.vsize = 1000;
+    await createSender({ id: 7, pjUri: {} as never, amount: 100000n, address: 'bcrt1qtest' });
+    expect(require('payjoin').payjoin.SenderBuilder.mock.results.at(-1).value.buildWithAdditionalFee)
+      .toHaveBeenCalledWith(1n, 1, 1n, false);
+  });
+
+  it.each([251, NaN, Infinity, 0, -1])('rejects funding rate %s before funding or signing', async rate => {
+    setupHappyPath();
+    cnClient.getFeeRate.mockResolvedValue({ result: { feerate: rate } });
+    await expect(createSender({ id: 7, pjUri: {} as never, amount: 100000n, address: 'bcrt1qtest' }))
+      .rejects.toThrow('funding fee rate');
+    expect(cnClient.createFundedPsbt).not.toHaveBeenCalled();
+    expect(cnClient.processPsbt).not.toHaveBeenCalled();
+  });
+
+  it('rejects an excessive original fee before signing the fallback', async () => {
+    setupHappyPath();
+    (await cnClient.decodePsbt()).result.fee = 50001 / 1e8;
+    await expect(createSender({ id: 7, pjUri: {} as never, amount: 100000n, address: 'bcrt1qtest' }))
+      .rejects.toThrow('transaction fee');
+    expect(cnClient.processPsbt).not.toHaveBeenCalled();
+    expect(cnClient.finalizePsbt).not.toHaveBeenCalled();
+  });
 
   it('records the funded psbt\'s exact input outpoints as lockedInputs before signing', async () => {
     setupHappyPath();
@@ -719,4 +767,14 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     expect(db.send.update).not.toHaveBeenCalled();
     expect(cnClient.processPsbt).not.toHaveBeenCalled();
   });
+});
+
+describe('absolute and rate fee limits', () => {
+  it.each([[50000, 1000, true], [50001, 1000, false], [250, 1, true],
+    [251, 1, false], [-1, 100, false], [1, 0, false], [1, NaN, false]])(
+    'checks %s sats / %s vbytes (accepted: %s)', (fee, vsize, accepted) => {
+      const decoded = { fee: fee / 1e8, tx: { vsize } } as any;
+      if (accepted) expect(() => assertFeeLimits(decoded, config)).not.toThrow();
+      else expect(() => assertFeeLimits(decoded, config)).toThrow();
+    });
 });

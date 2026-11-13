@@ -43,7 +43,7 @@ jest.mock('./Log2File', () => ({
 
 jest.mock('./persister', () => ({
   ReceiverPersister: jest.fn(),
-  SenderPersister: jest.fn(),
+  SenderPersister: jest.fn().mockImplementation(() => ({ load: () => ['initialized-event'] })),
 }));
 
 // ---------------------------------------------------------------------------
@@ -104,6 +104,7 @@ function makeReceive(overrides: Partial<Receive> = {}): Receive {
 
 function makeSend(overrides: Partial<Send> = {}): Send {
   return {
+    initializedTs: new Date(),
     id: 1,
     bip21: 'bitcoin:bc1qtest?amount=0.001&pj=https://example.com',
     amount: 100_000n,
@@ -715,9 +716,8 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
 
     await createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' });
 
-    // the trailing update is the fallback tx hex, recorded only once the
-    // original is signed — the lockedInputs write must still come first
-    expect(callOrder).toEqual(['db.send.update', 'processPsbt', 'db.send.update']);
+    // Persist locks first, then the signed fallback and initial SDK session.
+    expect(callOrder).toEqual(['db.send.update', 'processPsbt', 'db.send.update', 'db.send.update']);
   });
 
   it('records the signed original as fallbackTxHex so the expiry sweep can broadcast it', async () => {

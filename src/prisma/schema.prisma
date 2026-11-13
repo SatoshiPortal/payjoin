@@ -34,6 +34,7 @@ model Send {
   calledBackTs      DateTime?     @map("called_back_ts")
   expiryTs          DateTime?     @map("expiry_ts")
   cancelledTs       DateTime?     @map("cancelled_ts")
+  initializedTs     DateTime?     @map("initialized_ts")
   session           String?
   ohttpRelay        String?       @map("ohttp_relay")
   fallbackTs        DateTime?     @map("fallback_broadcast_ts")

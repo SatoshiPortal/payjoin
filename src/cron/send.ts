@@ -19,6 +19,7 @@ export async function restoreSendSessions(config: Config) {
     where: {
       confirmedTs: null,
       cancelledTs: null,
+      initializedTs: { not: null },
       expiryTs: {
         gt: new Date()
       },
@@ -42,6 +43,9 @@ export async function restoreSendSessions(config: Config) {
 
 export async function processSendSession(sendSess: Send, config: Config) {
   await lock.acquire([sendSess.id.toString(), sendSess.address!], async () => {
+    const fresh = await db.send.findUnique({ where: { id: sendSess.id } });
+    if (!fresh?.initializedTs || fresh.cancelledTs) return;
+    sendSess = fresh;
     logger.info(processSendSession, 'restoring session:', sendSess.id);
 
     if (sendSess.txid) {
@@ -311,9 +315,9 @@ export async function sweepTerminalSends(config: Config) {
       lockedInputs: { not: Prisma.DbNull },
       OR: [
         { cancelledTs: { not: null } },
-        { expiryTs: { lte: graceExpiredBefore } },
+        { initializedTs: { not: null }, expiryTs: { lte: graceExpiredBefore } },
         // our own cutoff is absolute: the grace only guards the receiver's post-expiry rebroadcast
-        { createdTs: { lte: cutoffBefore } },
+        { initializedTs: { not: null }, createdTs: { lte: cutoffBefore } },
       ],
     },
   });
@@ -428,6 +432,7 @@ async function settleBroadcastSend(sendSess: Send) {
  * mempool-acceptance result lets the broadcast proceed.
  */
 export async function broadcastSendFallback(sendSess: Send, config: Config): Promise<FallbackOutcome> {
+  if (!sendSess.initializedTs || sendSess.cancelledTs) return FallbackOutcome.Defer;
   const fallbackTxHex = sendSess.fallbackTxHex ?? await recoverFallbackTxHex(sendSess);
   if (!fallbackTxHex) {
     logger.warn(broadcastSendFallback, `no fallback tx available for send ${sendSess.id} — releasing its inputs unbroadcast`);

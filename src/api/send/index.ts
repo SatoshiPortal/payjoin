@@ -81,15 +81,29 @@ export async function send(params: IReqSend): Promise<IRespSend> {
 
     let sendRecord = await db.send.create({ data });
 
-    const { psbt } = await createSender({ id: sendRecord.id, pjUri, amount, address });
-    logger.debug('psbt:', psbt);
+    await lock.acquire([sendRecord.id.toString(), address], async () => {
+      try {
+        const { psbt } = await createSender({ id: sendRecord.id, pjUri, amount, address });
+        logger.debug('psbt:', psbt);
 
-    // watch the address for non-payjoin transactions
-    const watchUrl = addressCallbackUrl('send', address, sendRecord.callbackToken!);
-    await cnClient.watch({
-      address,
-      unconfirmedCallbackURL: watchUrl,
-      confirmedCallbackURL: watchUrl,
+        const watchUrl = addressCallbackUrl('send', address, sendRecord.callbackToken!);
+        const watch = await cnClient.watch({
+          address,
+          unconfirmedCallbackURL: watchUrl,
+          confirmedCallbackURL: watchUrl,
+        });
+        if (watch.error || !watch.result) throw new Error('Failed to watch send address');
+
+        sendRecord = await db.send.update({
+          where: { id: sendRecord.id }, data: { initializedTs: new Date() },
+        });
+      } catch (e) {
+        // Cancel under the session lock, before a worker can use this row.
+        await db.send.updateMany({
+          where: { id: sendRecord.id }, data: { cancelledTs: new Date() },
+        }).catch(cleanupError => logger.error(send, 'Failed to cancel incomplete send:', cleanupError));
+        throw e;
+      }
     });
 
     return appendSendStatus(sendRecord);

@@ -398,12 +398,14 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
     await db.send.update({ where: { id: Number(id) }, data: { fallbackTxHex: extractResult.hex } });
   }
 
-  const persister = new SenderPersister({ id, db });
+  // Persist the initial event log explicitly: background persister saves swallow errors.
+  const persister = new SenderPersister({});
 
   const builder = new payjoin.SenderBuilder(psbt, pjUri);
   (contribution > 0n
     ? builder.buildWithAdditionalFee(contribution, changeIndex, 1n, false)
     : builder.buildNonIncentivizing(1n)).save(persister);
+  await db.send.update({ where: { id: Number(id) }, data: { session: JSON.stringify(persister.load()) } });
 
   return {
     psbt,

@@ -356,8 +356,8 @@ describe('restoreSendSessions — precise release of stuck locked inputs', () =>
         lockedInputs: { not: Prisma.DbNull },
         OR: [
           { cancelledTs: { not: null } },
-          { expiryTs: { lte: expect.any(Date) } },
-          { createdTs: { lte: expect.any(Date) } },
+          { initializedTs: { not: null }, expiryTs: { lte: expect.any(Date) } },
+          { initializedTs: { not: null }, createdTs: { lte: expect.any(Date) } },
         ],
       },
     });
@@ -507,6 +507,7 @@ describe('processTerminalSend — fallback broadcast before releasing locks', ()
 
   function expiredRow(overrides: Record<string, unknown> = {}) {
     return {
+      initializedTs: new Date(),
       id: 42,
       lockedInputs: LOCKED,
       cancelledTs: null,

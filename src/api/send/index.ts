@@ -29,7 +29,7 @@ export function validateBip21(params: { bip21: string }): { isvalid: boolean, bi
 
     return { isvalid: true, bip21 };
   } catch {
-    return { isvalid: false, bip21, reason: 'Invalid bip21' };
+    return { isvalid: false, bip21, reason: 'Unsupported bip21' };
   }
 }
 
@@ -37,7 +37,7 @@ export async function send(params: IReqSend): Promise<IRespSend> {
   logger.info(send, params);
 
   if (!isValidBip21(params.bip21)) {
-    throw new JSONRPCErrorException('Invalid bip21', JSONRPCErrorCode.InvalidParams);
+    throw new JSONRPCErrorException('Unsupported bip21', JSONRPCErrorCode.InvalidParams);
   }
 
   try {

@@ -304,6 +304,22 @@ export async function createReceiver({ id, address, amount }: { id: number | str
 export function parseBip21(bip21: string): { pjUri: payjoin.PjUriInterface, amount: bigint, address: string, expiry: Date } {
   const uri = payjoin.Uri.parse(bip21);
   const pjUri = uri.checkPjSupported();
+  const endpoint = new URL(pjUri.pjEndpoint());
+  const mailboxId = endpoint.pathname.slice(1);
+  const fragmentParams = endpoint.hash.slice(1).split(/[-+]/);
+  const bech32Alphabet = 'QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L';
+
+  // The SDK also accepts v1. Require the v2 structure; the SDK validates keys and expiry.
+  const validMailboxId = /^[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{13}$/.test(mailboxId)
+    && bech32Alphabet.indexOf(mailboxId[12]) % 2 === 0;
+  const hasRequiredParams = ['EX1', 'OH1', 'RK1'].every(prefix => {
+    const matches = fragmentParams.filter(param => param.startsWith(prefix));
+    return matches.length === 1;
+  });
+
+  if (!validMailboxId || !hasRequiredParams) {
+    throw new Error('Only Payjoin v2 URIs are supported');
+  }
 
   const amount = BigInt(pjUri.amountSats() ?? 0);
   const address = pjUri.address() ?? '';

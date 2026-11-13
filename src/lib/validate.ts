@@ -1,4 +1,4 @@
-import { payjoin } from 'payjoin';
+import { parseBip21 } from './payjoin';
 import logger from './Log2File';
 import { cnClient } from "./globals";
 import { config } from "../config";
@@ -7,8 +7,7 @@ export function isValidBip21(bip21: string): boolean {
   logger.info(isValidBip21, bip21);
 
   try {
-    const uri = payjoin.Uri.parse(bip21);
-    uri.checkPjSupported();
+    parseBip21(bip21);
   } catch (e) {
     logger.error(isValidBip21, 'Failed to parse bip21:', e);
     return false;

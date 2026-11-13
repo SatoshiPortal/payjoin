@@ -112,7 +112,7 @@ describe('validateBip21', () => {
 
   it('returns an invalid result for SDK parsing failures', () => {
     jest.mocked(parseBip21).mockImplementationOnce(() => { throw new Error('bad endpoint'); });
-    expect(validateBip21({ bip21 })).toEqual({ isvalid: false, bip21, reason: 'Invalid bip21' });
+    expect(validateBip21({ bip21 })).toEqual({ isvalid: false, bip21, reason: 'Unsupported bip21' });
   });
 
   it('rejects expiry in both validation and send before side effects', async () => {

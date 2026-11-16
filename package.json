@@ -69,7 +69,7 @@
     "json-rpc-2.0": "1.8.1",
     "payjoin": "file:vendor/payjoin-1.0.0.tgz",
     "pg": "8.23.1",
-    "rimraf": "6.1.3",
+    "rimraf": "6.1.4",
     "sync-request": "6.1.0",
     "tslog": "4.11.0",
     "uniffi-bindgen-react-native": "github:spacebear21/uniffi-bindgen-react-native#tsconfig-module-nodenext"

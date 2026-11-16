@@ -29,7 +29,7 @@ export function validateBip21(params: { bip21: string }): { isvalid: boolean, bi
 
     return { isvalid: true, bip21 };
   } catch {
-    return { isvalid: false, bip21, reason: 'Invalid bip21' };
+    return { isvalid: false, bip21, reason: 'Unsupported bip21' };
   }
 }
 
@@ -37,7 +37,7 @@ export async function send(params: IReqSend): Promise<IRespSend> {
   logger.info(send, params);
 
   if (!isValidBip21(params.bip21)) {
-    throw new JSONRPCErrorException('Invalid bip21', JSONRPCErrorCode.InvalidParams);
+    throw new JSONRPCErrorException('Unsupported bip21', JSONRPCErrorCode.InvalidParams);
   }
 
   try {
@@ -81,15 +81,29 @@ export async function send(params: IReqSend): Promise<IRespSend> {
 
     let sendRecord = await db.send.create({ data });
 
-    const { psbt } = await createSender({ id: sendRecord.id, pjUri, amount, address });
-    logger.debug('psbt:', psbt);
+    await lock.acquire([sendRecord.id.toString(), address], async () => {
+      try {
+        const { psbt } = await createSender({ id: sendRecord.id, pjUri, amount, address });
+        logger.debug('psbt:', psbt);
 
-    // watch the address for non-payjoin transactions
-    const watchUrl = addressCallbackUrl('send', address, sendRecord.callbackToken!);
-    await cnClient.watch({
-      address,
-      unconfirmedCallbackURL: watchUrl,
-      confirmedCallbackURL: watchUrl,
+        const watchUrl = addressCallbackUrl('send', address, sendRecord.callbackToken!);
+        const watch = await cnClient.watch({
+          address,
+          unconfirmedCallbackURL: watchUrl,
+          confirmedCallbackURL: watchUrl,
+        });
+        if (watch.error || !watch.result) throw new Error('Failed to watch send address');
+
+        sendRecord = await db.send.update({
+          where: { id: sendRecord.id }, data: { initializedTs: new Date() },
+        });
+      } catch (e) {
+        // Cancel under the session lock, before a worker can use this row.
+        await db.send.updateMany({
+          where: { id: sendRecord.id }, data: { cancelledTs: new Date() },
+        }).catch(cleanupError => logger.error(send, 'Failed to cancel incomplete send:', cleanupError));
+        throw e;
+      }
     });
 
     return appendSendStatus(sendRecord);

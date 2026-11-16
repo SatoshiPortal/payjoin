@@ -28,12 +28,14 @@ jest.mock('../../lib/db', () => ({
     send: {
       findUnique: jest.fn(),
       create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 1, ...data })),
+      update: jest.fn(async ({ data }) => ({ id: 1, ...data })),
+      updateMany: jest.fn(async () => ({ count: 1 })),
     },
   },
 }));
 
 jest.mock('../../lib/globals', () => ({
-  cnClient: { watch: jest.fn(async () => ({})) },
+  cnClient: { watch: jest.fn(async () => ({ result: { id: 1 } })) },
   lock: { acquire: jest.fn((_key: unknown, fn: () => unknown) => fn()) },
 }));
 
@@ -110,7 +112,7 @@ describe('validateBip21', () => {
 
   it('returns an invalid result for SDK parsing failures', () => {
     jest.mocked(parseBip21).mockImplementationOnce(() => { throw new Error('bad endpoint'); });
-    expect(validateBip21({ bip21 })).toEqual({ isvalid: false, bip21, reason: 'Invalid bip21' });
+    expect(validateBip21({ bip21 })).toEqual({ isvalid: false, bip21, reason: 'Unsupported bip21' });
   });
 
   it('rejects expiry in both validation and send before side effects', async () => {

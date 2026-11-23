@@ -3,12 +3,29 @@ import { addJsonRpcMethod } from "..";
 import logger from "../../lib/Log2File";
 import { isValidAddress, isValidAmount, isValidBip21 } from "../../lib/validate";
 import { IReqSend, IRespSend } from "../../types/api/send";
-import { appendSendStatus, createSender, parseBip21 } from "../../lib/payjoin";
+import { appendSendStatus, createSender, parseBip21, RetryableSendError } from "../../lib/payjoin";
 import { config } from "../../config";
 import { db } from "../../lib/db";
 import { addressCallbackUrl } from "../callback";
 import { lock, cnClient } from "../../lib/globals";
 import { randomBytes } from "crypto";
+import type { Send } from "@prisma/client";
+
+function canRestartSend(send: Send | null): send is Send {
+  if (!send?.cancelledTs) {
+    return false;
+  }
+
+  const paymentState = [
+    send.initializedTs,
+    send.txid,
+    send.session,
+    send.fallbackTxHex,
+    send.lockedInputs,
+  ];
+
+  return !paymentState.some(Boolean);
+}
 
 export function registerSendApi(): void {
   addJsonRpcMethod('send', send);
@@ -79,9 +96,23 @@ export async function send(params: IReqSend): Promise<IRespSend> {
       expiryTs: expiry,
     }
 
-    let sendRecord = await db.send.create({ data });
+    // BIP21 is unique. Reuse only a cancelled, entirely unfunded initialization.
+    const previous = await db.send.findUnique({ where: { bip21: params.bip21 } });
+    let sendRecord = previous ?? await db.send.create({ data });
 
     await lock.acquire([sendRecord.id.toString(), address], async () => {
+      if (previous) {
+        const current = await db.send.findUnique({ where: { id: sendRecord.id } });
+        if (!canRestartSend(current)) {
+          throw new JSONRPCErrorException('Existing send cannot be restarted', JSONRPCErrorCode.InvalidRequest);
+        }
+
+        sendRecord = await db.send.update({
+          where: { id: current.id },
+          data: { ...data, cancelledTs: null, createdTs: new Date() },
+        });
+      }
+
       try {
         const { psbt } = await createSender({ id: sendRecord.id, pjUri, amount, address });
         logger.debug('psbt:', psbt);
@@ -102,6 +133,19 @@ export async function send(params: IReqSend): Promise<IRespSend> {
         await db.send.updateMany({
           where: { id: sendRecord.id }, data: { cancelledTs: new Date() },
         }).catch(cleanupError => logger.error(send, 'Failed to cancel incomplete send:', cleanupError));
+        if (e instanceof RetryableSendError) {
+          const cancelled = await db.send.findUnique({ where: { id: sendRecord.id } });
+          if (canRestartSend(cancelled)) {
+            throw new JSONRPCErrorException(e.message, JSONRPCErrorCode.InternalError, {
+              sendId: sendRecord.id,
+              retryable: true,
+              stage: e.stage,
+              reason: e.reason,
+              upstreamError: e.upstreamError,
+            });
+          }
+        }
+
         throw e;
       }
     });

@@ -51,7 +51,7 @@ jest.mock('./persister', () => ({
 // ---------------------------------------------------------------------------
 
 import { assertFeeLimits, extractFeeFromPsbt, appendReceiveStatus, appendSendStatus, extractExpiry, describePayjoinError, extractReplyableError, extractCommittedInputs, sessionHasPostedProposal, createSender, sendPayjoinDeadline } from './payjoin';
-import { ReceiveStatus, SendStatus } from '../types/payjoin';
+import { ReceiveStatus, SendStatus, SendFailureReason, SendFailureStage } from '../types/payjoin';
 import { Receive, Send } from '@prisma/client';
 import { config } from '../config';
 
@@ -752,7 +752,11 @@ describe('createSender — records exactly which outpoints lockUnspents:true loc
     cnClient.createFundedPsbt.mockResolvedValue({ result: null, error: { code: -4, message: 'Insufficient funds' } });
 
     await expect(createSender({ id: 7, pjUri: {} as never, amount: 100_000n, address: 'bcrt1qtest' }))
-      .rejects.toThrow('Failed to create funded psbt');
+      .rejects.toMatchObject({
+        stage: SendFailureStage.BeforeSigning,
+        reason: SendFailureReason.InsufficientFunds,
+        upstreamError: { code: -4, message: 'Insufficient funds' },
+      });
     expect(db.send.update).not.toHaveBeenCalled();
   });
 

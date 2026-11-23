@@ -20,6 +20,7 @@ jest.mock('../../lib/payjoin', () => ({
     expiry: new Date(Date.now() + 60_000),
   })),
   createSender: jest.fn(async () => ({ psbt: 'psbt' })),
+  RetryableSendError: class extends Error {},
   appendSendStatus: jest.fn((row: unknown) => row),
 }));
 
@@ -73,7 +74,10 @@ it('allows callback read-back while the session lock is held', async () => {
 });
 
 describe('send callback token', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    db.send.findUnique.mockResolvedValue(null);
+  });
 
   it('stores a random token and includes it in both watch callback URLs', async () => {
     await send({ bip21: 'bitcoin:bc1qsendaddress?amount=0.001&pj=https://example.com' });
@@ -94,7 +98,10 @@ describe('send callback token', () => {
 describe('validateBip21', () => {
   const bip21 = 'bitcoin:bc1qsendaddress?pj=https://example.com';
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    db.send.findUnique.mockResolvedValue(null);
+  });
 
   afterEach(() => {
     expect(db.send.create).not.toHaveBeenCalled();

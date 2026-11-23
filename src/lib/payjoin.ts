@@ -2,7 +2,7 @@ import { config, Config } from "../config";
 import { payjoin } from "payjoin";
 import Utils from "./Utils";
 import { Receive, Send } from "@prisma/client";
-import { ReceiveStatus, SendStatus } from "../types/payjoin";
+import { ReceiveStatus, SendStatus, SendFailureReason, SendFailureStage } from "../types/payjoin";
 import { IRespReceive } from "../types/api/receive";
 import { IRespSend } from "../types/api/send";
 import { cnClient } from "./globals";
@@ -331,6 +331,18 @@ export function parseBip21(bip21: string): { pjUri: payjoin.PjUriInterface, amou
   return { pjUri, amount, address, expiry };
 }
 
+// Only raised before signing is attempted. The API must also confirm cancellation.
+export class RetryableSendError extends Error {
+  readonly stage = SendFailureStage.BeforeSigning;
+
+  constructor(
+    readonly reason: SendFailureReason,
+    readonly upstreamError?: { code: number; message: string },
+  ) {
+    super(upstreamError?.message ?? 'Cyphernode error');
+  }
+}
+
 export async function createSender({id, pjUri, amount, address }: { id: number | string, pjUri: payjoin.PjUriInterface, amount: bigint, address: string }): Promise<{ 
   psbt: string 
 }> {
@@ -338,7 +350,7 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
     confTarget: 1,
   });
   if (feeError || !feeResult) {
-    throw new Error(`Failed to get fee rate: ${feeError}`);
+    throw new RetryableSendError(SendFailureReason.CyphernodeError, feeError);
   }
   const feeRate = Number(feeResult.feerate);
   if (!Number.isFinite(feeRate) || feeRate <= 0 || feeRate > config.MAX_PAYJOIN_FEE_RATE) {
@@ -349,7 +361,7 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
   // mobile wallet, which always uses the exact chain tip for anti-fee-sniping.
   const { error: chainInfoError, result: chainInfoResult } = await cnClient.getblockchaininfo();
   if (chainInfoError || !chainInfoResult) {
-    throw new Error(`Failed to get blockchain info: ${chainInfoError}`);
+    throw new RetryableSendError(SendFailureReason.CyphernodeError, chainInfoError);
   }
   const locktime = chainInfoResult.blocks;
 
@@ -368,7 +380,11 @@ export async function createSender({id, pjUri, amount, address }: { id: number |
   });
 
   if (psbtError || !psbtResult) {
-    throw new Error(`Failed to create funded psbt: ${psbtError}`);
+    if (psbtError?.code === -4 && /insufficient funds/i.test(psbtError.message)) {
+      throw new RetryableSendError(SendFailureReason.InsufficientFunds, psbtError);
+    }
+
+    throw new Error(`Failed to create funded psbt: ${JSON.stringify(psbtError)}`);
   }
 
   // record what lockUnspents:true just locked, before anything else here can throw

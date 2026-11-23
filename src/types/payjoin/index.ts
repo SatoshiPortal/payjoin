@@ -37,3 +37,12 @@ export enum SendStatus {
   Expired = 'expired',
   Cancelled = 'cancelled',
 }
+
+export enum SendFailureReason {
+  InsufficientFunds = 'insufficient-funds',
+  CyphernodeError = 'cyphernode-error',
+}
+
+export enum SendFailureStage {
+  BeforeSigning = 'before-signing',
+}

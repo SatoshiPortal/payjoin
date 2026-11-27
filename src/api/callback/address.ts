@@ -147,80 +147,14 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       const mismatched = type === "receive" && data.txid !== payjoin.txid;
       const looksLikeOurPayjoin = mismatched && await reservedInputWasSpent(payjoin as Receive);
 
-      if (mismatched && !looksLikeOurPayjoin) {
-        let updatedPayjoin: Receive;
-        if (payjoin.fallbackTs) {
-          // this is a fallback tx
-          logger.info(handleAddressCallback, "fallback transaction detected");
-          updatedPayjoin = await db.receive.update({
-            where: { id: payjoin.id },
-            data: {
-              amount: paidAmount, // record the amount verified from the transaction outputs
-              receiverFee: 0n, // we contribute no fee in a fallback tx
-              senderInAmount: null,
-              senderOutAmount: null,
-              receiverInAmount: 0n,
-              receiverOutAmount: 0n,
-              txInputs: Prisma.DbNull,
-              txOutputs: Prisma.DbNull,
-              fee: Utils.btcToSats(data.fees),
-              calledBackTs: null,
-              firstSeenTs: payjoin.firstSeenTs ?? new Date(),
-            }
-          });
-        } else {
-          // this is a non-payjoin transaction
-          logger.info(handleAddressCallback, "non-payjoin transaction detected");
-          updatedPayjoin = await db.receive.update({
-            where: { id: payjoin.id },
-            data: {
-              amount: paidAmount,
-              receiverFee: 0n, // we contribute no fee in a non-payjoin tx
-              senderInAmount: null,
-              senderOutAmount: null,
-              receiverInAmount: 0n,
-              receiverOutAmount: 0n,
-              txInputs: Prisma.DbNull,
-              txOutputs: Prisma.DbNull,
-              fee: Utils.btcToSats(data.fees),
-              txid: data.txid,
-              nonPayjoinTs: new Date(),
-              calledBackTs: null,
-              firstSeenTs: payjoin.firstSeenTs ?? new Date(),
-            }
-          });
-          logger.info(handleAddressCallback, "non-payjoin tx received for session");
-        }
-
-        // send the callback data
-        if (payjoin.callbackUrl) {
-          const postData = Utils.sanitizeResponse(
-            appendReceiveStatus(updatedPayjoin as Receive)
-          )
-          const response = await Utils.post(payjoin.callbackUrl, postData);
-          if (response.status >= 200 && response.status < 300) {
-            logger.info(handleAddressCallback, "callback sent to:", payjoin.callbackUrl);
-            await db.receive.update({
-              where: { id: payjoin.id },
-              data: {
-                calledBackTs: new Date()
-              }
-            });
-          }
-        }
-
-        return;
-      }
-
-      // not updating the amount here - it will be different from the actual payjoin amount
-      // @todo do we need to store it in a separate field?
       const updateData: any = {
         txid: data.txid,
         calledBackTs: null,
         fee: Utils.btcToSats(data.fees), // this fee will be the total - but we'll want the split as well
       }
       if (type === "send") {
-        let isFallback = !!payjoin.fallbackTs && payjoin.txid === data.txid;
+        // A fee bump changes the txid of an already recorded fallback.
+        let isFallback = !!payjoin.fallbackTs;
         if (!isFallback && payjoin.fallbackTxHex) {
           const { error, result } = await cnClient.decodeRawTransaction({ hex: payjoin.fallbackTxHex });
           isFallback = !error && result?.tx?.txid === data.txid;
@@ -241,7 +175,17 @@ export async function handleAddressCallback(data: any, type: "send" | "receive",
       }
 
       if (type === "receive") {
-        if (payjoin.fallbackTs || (payjoin as Receive).nonPayjoinTs) {
+        const ordinaryPayment = mismatched && !looksLikeOurPayjoin;
+        if (ordinaryPayment) {
+          updateData.amount = paidAmount;
+          if (payjoin.fallbackTs) {
+            logger.info(handleAddressCallback, "fallback transaction detected");
+          } else {
+            logger.info(handleAddressCallback, "non-payjoin transaction detected");
+            updateData.nonPayjoinTs = new Date();
+          }
+        }
+        if (ordinaryPayment || payjoin.fallbackTs || payjoin.nonPayjoinTs) {
           updateData.senderInAmount = null;
           updateData.senderOutAmount = null;
           updateData.receiverInAmount = 0n;

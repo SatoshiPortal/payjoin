@@ -459,6 +459,27 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
     expect(data.receiverOutAmount).toBe(0n);
   });
 
+  it.each([false, true])('confirms a newly classified receive and closes its watch (fallback: %s)', async fallback => {
+    const row = makeReceiveRow({ fallbackTs: fallback ? new Date() : null });
+    db.receive.findFirst.mockResolvedValue(row);
+    db.receive.update.mockImplementation(async ({ data }: any) => ({ ...row, ...data }));
+    cnClient.getTransaction.mockResolvedValue({ result: {
+      txid: REAL_TXID, confirmations: 1,
+      vout: [{ value: 0.001, scriptPubKey: { address: RECEIVE_ADDRESS } }],
+    } });
+
+    await handleAddressCallback(webhookData({ confirmations: 1 }), 'receive', CALLBACK_TOKEN);
+
+    expect(db.receive.update.mock.calls[0][0].data).toMatchObject({
+      txid: REAL_TXID, confirmedTs: expect.any(Date),
+    });
+    expect(Utils.post).toHaveBeenCalledWith(CALLBACK_URL, expect.objectContaining({
+      txid: REAL_TXID, status: 'confirmed',
+      ...(fallback ? { fallbackTs: expect.anything() } : { nonPayjoinTs: expect.anything() }),
+    }));
+    expect(cnClient.unwatch).toHaveBeenCalledTimes(1);
+  });
+
   it('still takes the fallback-tx path when fallbackTs is set, unaffected by the reserved-input check', async () => {
     const row = makeReceiveRow({
       txid: GUESSED_TXID,
@@ -488,6 +509,7 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
       txInputs: Prisma.DbNull,
       txOutputs: Prisma.DbNull,
       fee: 2381n,
+      txid: REAL_TXID,
     });
     expect(data).not.toHaveProperty('nonPayjoinTs');
   });
@@ -607,19 +629,19 @@ describe('handleAddressCallback — receive, txid mismatch classification', () =
 
 
 describe('handleAddressCallback — sender fallback fee', () => {
-  it.each([false, true])('reports the entire fee when fallback was already recorded: %s', async (alreadyRecorded) => {
-    const fallbackTs = alreadyRecorded ? new Date() : null;
+  it.each([null, REAL_TXID, GUESSED_TXID])('reports the entire fallback fee with previous txid %s', async previousTxid => {
+    const fallbackTs = previousTxid ? new Date() : null;
     const row = {
       ...makeReceiveRow({
-        txid: alreadyRecorded ? REAL_TXID : null,
+        txid: previousTxid,
         fallbackTs,
         fallbackTxHex: 'deadbeef',
       }),
-      senderFee: null,
+      senderFee: previousTxid ? 141n : null,
     };
     db.send.findFirst.mockResolvedValue(row);
     db.send.update.mockImplementation(async ({ data }: any) => ({ ...row, ...data }));
-    cnClient.decodeRawTransaction.mockResolvedValue({ result: { tx: { txid: REAL_TXID } } });
+    cnClient.decodeRawTransaction.mockResolvedValue({ result: { tx: { txid: previousTxid ?? REAL_TXID } } });
 
     await handleAddressCallback(webhookData({ fees: 0.00000987 }), 'send', CALLBACK_TOKEN);
 
